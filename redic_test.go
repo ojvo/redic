@@ -3,13 +3,13 @@ package redic
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-	"strings"
 
-	"github.com/alicebob/miniredis"
+	"github.com/alicebob/miniredis" // 建议使用 v2 版本
 	"github.com/gomodule/redigo/redis"
 )
 
@@ -168,7 +168,7 @@ func TestClient_PatternSubscribe(t *testing.T) {
 	}
 }
 
-// TestClient_Reconnection 测试重连功能
+// TestClient_Reconnection 测试初始连接失败的重连逻辑
 func TestClient_Reconnection(t *testing.T) {
 	var connectingCalled, connectedCalled, disconnectedCalled int32
 	var reconnectingCalled, giveUpCalled int32
@@ -223,6 +223,112 @@ func TestClient_Reconnection(t *testing.T) {
 	}
 }
 
+// TestClient_Runtime_Recovery 测试运行时断线重连与订阅自动恢复 (核心测试)
+func TestClient_Runtime_Recovery(t *testing.T) {
+	// 1. 启动 Miniredis
+	s, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	// 注意：我们要手动控制它的生死，最后再 Close
+
+	// 2. 配置重连策略
+	var connectedCount int32
+	cfg := &ReconnectConfig{
+		MaxRetries:   100, // 确保重试次数足够覆盖重启时间
+		InitialDelay: 10 * time.Millisecond,
+		MaxDelay:     100 * time.Millisecond,
+		OnConnected: func() {
+			atomic.AddInt32(&connectedCount, 1)
+			t.Log("Callback: Connected")
+		},
+	}
+
+	client := NewClient(s.Addr(), "", 0, cfg)
+	defer client.Close()
+
+	if err := client.Connect(); err != nil {
+		t.Fatalf("Initial connect failed: %v", err)
+	}
+
+	// 3. 正常订阅
+	subCh := make(chan string, 10)
+	client.Subscribe("recovery_chan", func(ch, msg string) {
+		subCh <- msg
+	})
+
+	// 确保订阅成功
+	time.Sleep(100 * time.Millisecond)
+	if client.subManager.GetSubscriptionCount() != 1 {
+		t.Fatal("Subscription failed initially")
+	}
+
+	// 4. 模拟灾难：强制关闭 Redis 服务器
+	t.Log(">>> CRASHING REDIS SERVER <<<")
+	s.Close()
+
+	// 5. 等待客户端感知到断开 (状态变为 Reconnecting)
+	deadline := time.Now().Add(2 * time.Second)
+	stateSwitched := false
+	for time.Now().Before(deadline) {
+		if client.GetState() == StateReconnecting {
+			stateSwitched = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stateSwitched {
+		// 注意：如果重试非常快，可能瞬间又连上了（如果server没关死），但在miniredis close情况下应该会变成reconnecting
+		t.Logf("Warning: Client state is %v, expected Reconnecting", client.GetState())
+	}
+
+	// 6. 模拟恢复：重启 Redis 服务器
+	t.Log(">>> RESTARTING REDIS SERVER <<<")
+	if err := s.Restart(); err != nil {
+		t.Fatalf("Failed to restart miniredis: %v", err)
+	}
+
+	// 7. 等待自动重连完成
+	reconnected := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.GetState() == StateConnected {
+			reconnected = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if !reconnected {
+		t.Fatalf("Client failed to reconnect automatically. State: %v", client.GetState())
+	}
+
+	// 8. 验证核心：订阅是否自动恢复了？
+	// Miniredis 重启后是空的，但我们的 Client 应该会自动补发 SUBSCRIBE 命令
+	time.Sleep(200 * time.Millisecond) // 给 Resubscribe 一点时间
+
+	// 发布消息验证
+	// 注意：这里使用 miniredis 的 Publish 直接发布，或者是 client.Publish 都可以
+	// 为了验证 client 连接确实可用，我们用 client.Publish
+	if err := client.Publish("recovery_chan", "i_am_back"); err != nil {
+		t.Fatalf("Publish failed after recovery: %v", err)
+	}
+
+	select {
+	case msg := <-subCh:
+		if msg != "i_am_back" {
+			t.Errorf("Received wrong message after recovery: %s", msg)
+		} else {
+			t.Log("SUCCESS: Subscription recovered automatically!")
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("FAIL: Did not receive message after reconnection. Resubscribe logic failed.")
+	}
+
+	// 清理
+	s.Close()
+}
+
 // TestClient_ConcurrentOperations 测试并发操作安全性
 func TestClient_ConcurrentOperations(t *testing.T) {
 	m, err := miniredis.Run()
@@ -251,18 +357,18 @@ func TestClient_ConcurrentOperations(t *testing.T) {
 			for j := 0; j < numOperations; j++ {
 				key := fmt.Sprintf("key_%d_%d", id, j)
 				value := fmt.Sprintf("value_%d_%d", id, j)
-				
+
 				if err := c.Set(key, value); err != nil {
 					t.Errorf("set %s failed: %v", key, err)
 					return
 				}
-				
+
 				val, err := c.Get(key)
 				if err != nil {
 					t.Errorf("get %s failed: %v", key, err)
 					return
 				}
-				
+
 				if val != value {
 					t.Errorf("key %s: expected %q, got %q", key, value, val)
 					return
@@ -277,7 +383,11 @@ func TestClient_ConcurrentOperations(t *testing.T) {
 // TestClient_ErrorHandling 测试错误处理
 func TestClient_ErrorHandling(t *testing.T) {
 	// Test connecting to invalid address
-	c := NewClient("invalid:address:12345", "", 0, nil)
+	cfg := DefaultReconnectConfig()
+	cfg.MaxRetries = 2 // 限制重试次数，避免测试时间过长
+	cfg.InitialDelay = 100 * time.Millisecond
+	
+	c := NewClient("invalid:address:12345", "", 0, cfg)
 	defer c.Close()
 
 	err := c.Connect()
@@ -285,10 +395,19 @@ func TestClient_ErrorHandling(t *testing.T) {
 		t.Fatalf("expected error when connecting to invalid address")
 	}
 
-	// Verify client state
+	// Verify client state - 允许处于重连状态
 	state := c.GetState()
-	if state != StateDisconnected && state != StateFailed {
-		t.Errorf("expected StateDisconnected or StateFailed, got %v", state)
+	if state != StateDisconnected && state != StateFailed && state != StateReconnecting {
+		t.Errorf("expected StateDisconnected, StateFailed or StateReconnecting, got %v", state)
+	}
+
+	// 等待重连尝试完成
+	time.Sleep(1 * time.Second)
+	
+	// 现在应该是 Failed 状态（达到最大重试次数）
+	state = c.GetState()
+	if state != StateFailed && state != StateDisconnected {
+		t.Errorf("after retries, expected StateFailed or StateDisconnected, got %v", state)
 	}
 
 	// Test operations on disconnected client
@@ -413,7 +532,7 @@ func TestClient_SubscriptionManagement(t *testing.T) {
 	// Test subscribing to multiple channels at once
 	channels := []string{"multi_chan_1", "multi_chan_2", "multi_chan_3"}
 	msgChannels := make([]chan string, len(channels))
-	
+
 	for i, channel := range channels {
 		msgChannels[i] = make(chan string, 5)
 		channelIndex := i
@@ -755,7 +874,7 @@ func TestClient_MultipleClients(t *testing.T) {
 	for i := 0; i < numClients; i++ {
 		clients[i] = NewClient(m.Addr(), "", 0, nil)
 		messageChannels[i] = make(chan string, 10)
-		
+
 		if err := clients[i].Connect(); err != nil {
 			t.Fatalf("client %d connect failed: %v", i, err)
 		}
@@ -788,7 +907,7 @@ func TestClient_MultipleClients(t *testing.T) {
 	for i := 0; i < numClients; i++ {
 		channel := fmt.Sprintf("client_%d_channel", i)
 		message := fmt.Sprintf("individual_message_%d", i)
-		
+
 		if err := clients[0].Publish(channel, message); err != nil {
 			t.Fatalf("publish to client %d channel failed: %v", i, err)
 		}
@@ -809,11 +928,12 @@ func TestClient_MultipleClients(t *testing.T) {
 	for i := 0; i < numClients; i++ {
 		expectedIndividual := fmt.Sprintf("individual_message_%d", i)
 		expectedBroadcast := fmt.Sprintf("broadcast:%s", broadcastMessage)
-		
+
 		// 收集该客户端的消息，但允许部分失败
 		timeout := time.NewTimer(1 * time.Second)
-		defer timeout.Stop()
 
+		// 内部循环标签
+	ClientLoop:
 		for {
 			select {
 			case msg := <-messageChannels[i]:
@@ -825,12 +945,10 @@ func TestClient_MultipleClients(t *testing.T) {
 					t.Logf("client %d received broadcast message: %s", i, msg)
 				}
 			case <-timeout.C:
-				// 超时，跳出循环
-				goto nextClient
+				break ClientLoop
 			}
 		}
-		
-		nextClient:
+		timeout.Stop()
 	}
 
 	// 验证至少收到了一些消息（允许部分失败由于连接问题）
@@ -849,14 +967,14 @@ func TestClient_MultipleClients(t *testing.T) {
 	// Clean up all clients
 	for i, client := range clients {
 		client.Close()
-		
+
 		if client.GetState() != StateDisconnected {
-			t.Errorf("client %d: expected StateDisconnected after close, got %v", 
+			t.Errorf("client %d: expected StateDisconnected after close, got %v",
 				i, client.GetState())
 		}
 	}
 
-	t.Logf("Multi-client test completed with %d individual and %d broadcast messages received", 
+	t.Logf("Multi-client test completed with %d individual and %d broadcast messages received",
 		individualMessagesReceived, broadcastMessagesReceived)
 }
 
@@ -881,17 +999,17 @@ func BenchmarkClient_SetGet(b *testing.B) {
 		for pb.Next() {
 			key := fmt.Sprintf("bench_key_%d", i)
 			value := fmt.Sprintf("bench_value_%d", i)
-			
+
 			if err := c.Set(key, value); err != nil {
 				b.Errorf("set failed: %v", err)
 				return
 			}
-			
+
 			if _, err := c.Get(key); err != nil {
 				b.Errorf("get failed: %v", err)
 				return
 			}
-			
+
 			i++
 		}
 	})
@@ -926,12 +1044,12 @@ func BenchmarkClient_Publish(b *testing.B) {
 		for pb.Next() {
 			channel := fmt.Sprintf("bench_channel_%d", i%5)
 			message := fmt.Sprintf("bench_message_%d", i)
-			
+
 			if err := c.Publish(channel, message); err != nil {
 				b.Errorf("publish failed: %v", err)
 				return
 			}
-			
+
 			i++
 		}
 	})
@@ -1238,7 +1356,7 @@ func TestClient_ResourceCleanup(t *testing.T) {
 
 	t.Run("normal_cleanup", func(t *testing.T) {
 		c := NewClient(m.Addr(), "", 0, nil)
-		
+
 		if err := c.Connect(); err != nil {
 			t.Fatalf("connect failed: %v", err)
 		}
@@ -1273,7 +1391,7 @@ func TestClient_ResourceCleanup(t *testing.T) {
 
 	t.Run("multiple_close_calls", func(t *testing.T) {
 		c := NewClient(m.Addr(), "", 0, nil)
-		
+
 		if err := c.Connect(); err != nil {
 			t.Fatalf("connect failed: %v", err)
 		}
@@ -1456,7 +1574,7 @@ func TestClient_PerformanceBaseline(t *testing.T) {
 
 	t.Run("get_performance", func(t *testing.T) {
 		const numOps = 1000
-		
+
 		// Prepare data
 		for i := 0; i < numOps; i++ {
 			key := fmt.Sprintf("get_perf_key_%d", i)
@@ -1590,7 +1708,7 @@ func TestClient_RealWorldScenarios(t *testing.T) {
 		for _, user := range users {
 			userNotifications[user] = make(chan string, 10)
 			channel := fmt.Sprintf("user:%s:notifications", user)
-			
+
 			// Capture user variable for closure
 			userID := user
 			if err := notifier.Subscribe(channel, func(ch, msg string) {
@@ -1746,10 +1864,10 @@ func TestClient_Integration(t *testing.T) {
 	// Create clients for different roles
 	publisher := NewClient(m.Addr(), "", 0, nil)
 	defer publisher.Close()
-	
+
 	subscriber := NewClient(m.Addr(), "", 0, nil)
 	defer subscriber.Close()
-	
+
 	dataStore := NewClient(m.Addr(), "", 0, nil)
 	defer dataStore.Close()
 
@@ -1962,36 +2080,6 @@ func TestClient_Integration(t *testing.T) {
 	t.Log("Integration test passed successfully")
 }
 
-// Helper function to wait for a condition with timeout
-func waitForCondition(t *testing.T, condition func() bool, timeout time.Duration, description string) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timeout waiting for condition: %s", description)
-}
-
-// Helper function to verify subscription count
-func verifySubscriptionCount(t *testing.T, c *Client, expected int) {
-	if count := c.subManager.GetSubscriptionCount(); count != expected {
-		t.Errorf("expected %d subscriptions, got %d", expected, count)
-	}
-}
-
-// Helper function to create test data
-func createTestData(prefix string, count int) map[string]string {
-	data := make(map[string]string)
-	for i := 0; i < count; i++ {
-		key := fmt.Sprintf("%s_key_%d", prefix, i)
-		value := fmt.Sprintf("%s_value_%d", prefix, i)
-		data[key] = value
-	}
-	return data
-}
-
 // TestClient_FeatureCoverage 功能覆盖率验证
 func TestClient_FeatureCoverage(t *testing.T) {
 	t.Log("Verifying feature coverage of test suite:")
@@ -2004,7 +2092,8 @@ func TestClient_FeatureCoverage(t *testing.T) {
 		{"Basic Operations", "TestClient_BasicOperations", "Set/Get operations and error handling"},
 		{"Pub/Sub", "TestClient_PubSub", "Basic publish/subscribe functionality"},
 		{"Pattern Subscribe", "TestClient_PatternSubscribe", "Pattern-based subscriptions"},
-		{"Reconnection", "TestClient_Reconnection", "Connection recovery and callbacks"},
+		{"Reconnection (Initial)", "TestClient_Reconnection", "Connection recovery and callbacks"},
+		{"Runtime Recovery", "TestClient_Runtime_Recovery", "Recover subscription after server crash & restart"},
 		{"Concurrency", "TestClient_ConcurrentOperations", "Thread safety and parallel operations"},
 		{"Error Handling", "TestClient_ErrorHandling", "Invalid connections and operations"},
 		{"Subscription Management", "TestClient_SubscriptionManagement", "Subscribe/unsubscribe lifecycle"},
@@ -2027,14 +2116,14 @@ func TestClient_FeatureCoverage(t *testing.T) {
 	t.Logf("Total features tested: %d", len(features))
 
 	for i, feature := range features {
-		t.Logf("✓ %2d. %-20s [%s] - %s", 
+		t.Logf("✓ %2d. %-24s [%s] - %s",
 			i+1, feature.name, feature.testFunc, feature.description)
 	}
 
 	// Verify all major components are covered
 	components := []string{
 		"Client creation and configuration",
-		"Connection management and pooling", 
+		"Connection management and pooling",
 		"Redis command execution (SET/GET)",
 		"Publish/Subscribe messaging",
 		"Pattern subscriptions",
@@ -2060,18 +2149,13 @@ func TestClient_FeatureCoverage(t *testing.T) {
 
 // TestMain 测试套件入口点
 func TestMain(m *testing.M) {
-	// 可以在这里添加全局测试设置和清理
 	fmt.Println("Starting Redis client test suite...")
-	
+
 	// 运行所有测试
 	code := m.Run()
-	
+
 	fmt.Println("Redis client test suite completed.")
-	
+
 	// 退出时使用测试结果代码
 	os.Exit(code)
 }
-
-
-
-

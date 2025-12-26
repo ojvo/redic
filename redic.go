@@ -15,6 +15,10 @@ import (
 	"github.com/gomodule/redigo/redis"
 )
 
+// --------------------------------------------------------------------------------
+// 错误定义与常量
+// --------------------------------------------------------------------------------
+
 var nonNetworkErrors = []error{
 	redis.ErrNil,
 	context.Canceled,
@@ -29,6 +33,7 @@ var knownNetworkErrors = []error{
 	redis.ErrPoolExhausted,
 }
 
+// 常见网络层系统错误，用于底层判断
 var networkSyscallErrnos = map[syscall.Errno]struct{}{
 	syscall.ECONNRESET:   {},
 	syscall.ECONNABORTED: {},
@@ -45,13 +50,11 @@ var networkSyscallErrnos = map[syscall.Errno]struct{}{
 }
 
 const (
-	defaultInitialDelay             = 1 * time.Second
-	defaultMaxDelay                 = 30 * time.Second
-	defaultBackoffMultiplier        = 2.0
-	defaultPingTimeout              = 5 * time.Second
-	defaultReadDeadline             = 60 * time.Second
-	defaultResubscribeMaxWait       = 10 * time.Second
-	defaultResubscribeCheckInterval = 200 * time.Millisecond
+	defaultInitialDelay      = 1 * time.Second
+	defaultMaxDelay          = 30 * time.Second
+	defaultBackoffMultiplier = 2.0
+	defaultPingTimeout       = 5 * time.Second
+	defaultReadDeadline      = 60 * time.Second // 读超时（心跳检测）
 )
 
 // 连接状态
@@ -73,14 +76,17 @@ func (s ConnectionState) String() string {
 	return "Unknown"
 }
 
-// 重连配置
+// --------------------------------------------------------------------------------
+// 配置结构体
+// --------------------------------------------------------------------------------
+
 type ReconnectConfig struct {
-	MaxRetries        int           // 最大重试次数，-1表示无限重试
-	InitialDelay      time.Duration // 初始重连延迟
-	MaxDelay          time.Duration // 最大重连延迟
-	BackoffMultiplier float64       // 退避倍数
-	Jitter            bool          // 是否添加随机抖动
-	PingTimeout       time.Duration // Ping超时时间
+	MaxRetries        int           // -1 表示无限重试
+	InitialDelay      time.Duration
+	MaxDelay          time.Duration
+	BackoffMultiplier float64
+	Jitter            bool
+	PingTimeout       time.Duration
 
 	// 事件回调
 	OnConnecting   func()
@@ -91,7 +97,6 @@ type ReconnectConfig struct {
 	OnGiveUp       func(error)
 }
 
-// 默认配置
 func DefaultReconnectConfig() *ReconnectConfig {
 	return &ReconnectConfig{
 		MaxRetries:        -1, // 无限重试
@@ -103,13 +108,16 @@ func DefaultReconnectConfig() *ReconnectConfig {
 	}
 }
 
-// 订阅信息
+// --------------------------------------------------------------------------------
+// 订阅信息实体
+// --------------------------------------------------------------------------------
+
 type SubscriptionInfo struct {
 	Channel   string
 	Pattern   string
 	Handler   func(channel, message string)
 	IsPattern bool
-	Active    int32 // atomic
+	Active    int32 // atomic: 1=active, 0=inactive
 }
 
 func (s *SubscriptionInfo) Key() string {
@@ -123,28 +131,27 @@ func (s *SubscriptionInfo) IsActive() bool {
 	return atomic.LoadInt32(&s.Active) == 1
 }
 
-func (s *SubscriptionInfo) SetActive(active bool) {
-	if active {
-		atomic.StoreInt32(&s.Active, 1)
-	} else {
-		atomic.StoreInt32(&s.Active, 0)
-	}
-}
-
+// --------------------------------------------------------------------------------
 // 订阅管理器
-type SubscriptionManager struct {
-	mu            sync.RWMutex
-	subscriptions map[string]*SubscriptionInfo
-	pubsubConn    *redis.PubSubConn
-	connMu        sync.Mutex
-	pool          *redis.Pool
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
-	client        *Client
+// --------------------------------------------------------------------------------
 
-	receiving     int32
-	resubscribing int32
+type SubscriptionManager struct {
+	// 保护 subscriptions map
+	subMu         sync.RWMutex
+	subscriptions map[string]*SubscriptionInfo
+
+	// 保护 pubsubConn 对象本身指针的读写
+	connMu     sync.RWMutex
+	pubsubConn *redis.PubSubConn
+
+	pool   *redis.Pool
+	client *Client
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// 状态标志，确保只启动一个接收协程
+	receiving int32
 }
 
 func NewSubscriptionManager(pool *redis.Pool, client *Client) *SubscriptionManager {
@@ -158,6 +165,41 @@ func NewSubscriptionManager(pool *redis.Pool, client *Client) *SubscriptionManag
 	}
 }
 
+// ensureConnection 确保连接已建立并启动接收循环
+func (sm *SubscriptionManager) ensureConnection() (*redis.PubSubConn, error) {
+	sm.connMu.Lock()
+	defer sm.connMu.Unlock()
+
+	// 1. 如果已有连接，直接返回
+	if sm.pubsubConn != nil {
+		return sm.pubsubConn, nil
+	}
+
+	// 2. 检查 Client 状态，如果主 Client 断开了，直接拒绝新的连接尝试
+	if sm.client.GetState() != StateConnected {
+		return nil, errors.New("client must be in connected state to create subscription connection")
+	}
+
+	// 3. 创建新连接
+	conn := sm.pool.Get()
+	// 测试连接是否有效
+	if _, err := conn.Do("PING"); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	psc := &redis.PubSubConn{Conn: conn}
+	sm.pubsubConn = psc
+
+	// 4. 启动接收协程 (保证只启动一次)
+	if atomic.CompareAndSwapInt32(&sm.receiving, 0, 1) {
+		sm.wg.Add(1)
+		go sm.subscriptionReceiver()
+	}
+
+	return psc, nil
+}
+
 func (sm *SubscriptionManager) Subscribe(channel string, handler func(channel, message string)) error {
 	if handler == nil {
 		return errors.New("handler cannot be nil")
@@ -167,14 +209,14 @@ func (sm *SubscriptionManager) Subscribe(channel string, handler func(channel, m
 		Channel:   channel,
 		Handler:   handler,
 		IsPattern: false,
+		Active:    1,
 	}
-	sub.SetActive(true)
 
-	sm.mu.Lock()
+	sm.subMu.Lock()
 	sm.subscriptions[sub.Key()] = sub
-	sm.mu.Unlock()
+	sm.subMu.Unlock()
 
-	return sm.doSubscribe(channel, false)
+	return sm.doSubscribe(sub)
 }
 
 func (sm *SubscriptionManager) PSubscribe(pattern string, handler func(channel, message string)) error {
@@ -186,460 +228,325 @@ func (sm *SubscriptionManager) PSubscribe(pattern string, handler func(channel, 
 		Pattern:   pattern,
 		Handler:   handler,
 		IsPattern: true,
+		Active:    1,
 	}
-	sub.SetActive(true)
 
-	sm.mu.Lock()
+	sm.subMu.Lock()
 	sm.subscriptions[sub.Key()] = sub
-	sm.mu.Unlock()
+	sm.subMu.Unlock()
 
-	return sm.doSubscribe(pattern, true)
+	return sm.doSubscribe(sub)
 }
 
-func (sm *SubscriptionManager) doSubscribe(channelOrPattern string, isPattern bool) error {
-	sm.connMu.Lock()
-	defer sm.connMu.Unlock()
-
-	if sm.pubsubConn == nil {
-		conn := sm.pool.Get()
-		sm.pubsubConn = &redis.PubSubConn{Conn: conn}
-		if atomic.CompareAndSwapInt32(&sm.receiving, 0, 1) {
-			sm.wg.Add(1)
-			go sm.subscriptionReceiver()
-		}
+// 执行底层订阅操作
+func (sm *SubscriptionManager) doSubscribe(subscription *SubscriptionInfo) error {
+	psc, err := sm.ensureConnection()
+	if err != nil {
+		// 如果连接尚未准备好，只保存到 map 中，等待重连逻辑处理
+		// 并不是严重错误，只要不是逻辑错误都可以接受静默失败
+		log.Printf("[Redic] 暂时无法发送订阅命令（将在重连时自动恢复）: %v", err)
+		return nil
 	}
 
-	var err error
-	if isPattern {
-		err = sm.pubsubConn.PSubscribe(channelOrPattern)
+	if subscription.IsPattern {
+		err = psc.PSubscribe(subscription.Pattern)
 	} else {
-		err = sm.pubsubConn.Subscribe(channelOrPattern)
+		err = psc.Subscribe(subscription.Channel)
 	}
 
-	if err != nil && isNetworkError(err) {
-		sm.handleConnectionError(err)
-		return err
-	}
-
-	log.Printf("订阅成功: %s (pattern: %v)", channelOrPattern, isPattern)
 	return err
 }
 
 func (sm *SubscriptionManager) Unsubscribe(channels ...string) error {
-	for _, channel := range channels {
-		key := "channel:" + channel
-		sm.mu.Lock()
-		if sub, exists := sm.subscriptions[key]; exists {
-			sub.SetActive(false)
-			delete(sm.subscriptions, key)
-		}
-		sm.mu.Unlock()
+	// 1. 先清理 Map，如果在发送命令前断网，这能保证重连后不会再订阅这些频道
+	sm.subMu.Lock()
+	for _, ch := range channels {
+		delete(sm.subscriptions, "channel:"+ch)
 	}
+	sm.subMu.Unlock()
 
-	sm.connMu.Lock()
-	defer sm.connMu.Unlock()
+	// 2. 获取连接操作
+	sm.connMu.RLock()
+	psc := sm.pubsubConn
+	sm.connMu.RUnlock()
 
-	if sm.pubsubConn != nil {
+	if psc != nil {
 		args := make([]interface{}, len(channels))
-		for i, channel := range channels {
-			args[i] = channel
+		for i, v := range channels {
+			args[i] = v
 		}
-		return sm.pubsubConn.Unsubscribe(args...)
+		return psc.Unsubscribe(args...)
 	}
-
 	return nil
 }
 
 func (sm *SubscriptionManager) PUnsubscribe(patterns ...string) error {
-	for _, pattern := range patterns {
-		key := "pattern:" + pattern
-		sm.mu.Lock()
-		if sub, exists := sm.subscriptions[key]; exists {
-			sub.SetActive(false)
-			delete(sm.subscriptions, key)
-		}
-		sm.mu.Unlock()
+	sm.subMu.Lock()
+	for _, p := range patterns {
+		delete(sm.subscriptions, "pattern:"+p)
 	}
+	sm.subMu.Unlock()
 
-	sm.connMu.Lock()
-	defer sm.connMu.Unlock()
+	sm.connMu.RLock()
+	psc := sm.pubsubConn
+	sm.connMu.RUnlock()
 
-	if sm.pubsubConn != nil {
+	if psc != nil {
 		args := make([]interface{}, len(patterns))
-		for i, pattern := range patterns {
-			args[i] = pattern
+		for i, v := range patterns {
+			args[i] = v
 		}
-		return sm.pubsubConn.PUnsubscribe(args...)
+		return psc.PUnsubscribe(args...)
 	}
-
 	return nil
 }
 
-// 消息接收器
+// --------------------------------------------------------------------------------
+// 核心接收与重连逻辑
+// --------------------------------------------------------------------------------
+
 func (sm *SubscriptionManager) subscriptionReceiver() {
 	defer sm.wg.Done()
 	defer atomic.StoreInt32(&sm.receiving, 0)
 
 	for {
+		// 1. 检查退出
 		select {
 		case <-sm.ctx.Done():
 			return
 		default:
 		}
 
-		sm.connMu.Lock()
-		if sm.pubsubConn == nil {
-			sm.connMu.Unlock()
-			time.Sleep(time.Second)
+		// 2. [修复死锁关键点] 获取连接后立即释放 RLock，不允许带着锁进入阻塞 IO
+		sm.connMu.RLock()
+		psc := sm.pubsubConn
+		sm.connMu.RUnlock()
+
+		if psc == nil {
+			// 连接为空，说明可能正在断线/重连中，稍等重试
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
-		if conn, ok := sm.pubsubConn.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		// 3. 设置心跳/读超时
+		if conn, ok := psc.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
 			conn.SetReadDeadline(time.Now().Add(defaultReadDeadline))
 		}
 
-		msg := sm.pubsubConn.Receive()
-		sm.connMu.Unlock()
+		// 4. 阻塞接收 (IO Wait)
+		msg := psc.Receive()
 
-		if msg == nil {
-			continue
+		// 5. 处理结果
+		if err, ok := msg.(error); ok {
+			// 处理超时错误
+			if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+				// 仅是心跳超时，连接正常，继续循环
+				continue
+			}
+
+			// 如果是其他错误，且 Context 未取消，认为是真正断线
+			if sm.ctx.Err() == nil {
+				log.Printf("[Redic] 订阅连接断开: %v", err)
+				// 异步触发，避免阻塞自身
+				go sm.handleDisconnect()
+			}
+			return
 		}
 
 		sm.handleMessage(msg)
 	}
 }
 
+// 处理断线清理
+func (sm *SubscriptionManager) handleDisconnect() {
+	sm.connMu.Lock()
+	if sm.pubsubConn != nil {
+		sm.pubsubConn.Close()
+		sm.pubsubConn = nil
+	}
+	sm.connMu.Unlock()
+
+	// 触发 Client 级别的重连
+	if sm.client != nil {
+		sm.client.triggerReconnect(errors.New("subscription connection lost"))
+	}
+}
+
+// 重新订阅所有 (重连成功后调用)
+func (sm *SubscriptionManager) ResubscribeAll() {
+	log.Println("[Redic] 开始恢复订阅...")
+
+	// 1. 确保新连接建立
+	_, err := sm.ensureConnection()
+	if err != nil {
+		log.Printf("[Redic] 恢复订阅失败，无法建立连接: %v", err)
+		return
+	}
+
+	// 2. 获取当前所有活跃订阅快照
+	sm.subMu.RLock()
+	var subs []*SubscriptionInfo
+	for _, sub := range sm.subscriptions {
+		if sub.IsActive() {
+			subs = append(subs, sub)
+		}
+	}
+	sm.subMu.RUnlock()
+
+	// 3. 逐个重新发送指令
+	count := 0
+	for _, sub := range subs {
+		// [修复竞态条件关键点]
+		// 在快照之后、实际发送订阅前，需再次确认该订阅是否仍存在于 Map 中
+		// 防止断网期间用户调用 Unsubscribe，但重连逻辑错误地又把它恢复了
+		sm.subMu.RLock()
+		_, exists := sm.subscriptions[sub.Key()]
+		sm.subMu.RUnlock()
+
+		if !exists {
+			continue // 已经被删除了，跳过
+		}
+
+		if err := sm.doSubscribe(sub); err != nil {
+			log.Printf("[Redic] 恢复订阅 %s 失败: %v", sub.Key(), err)
+		} else {
+			count++
+		}
+	}
+	log.Printf("[Redic] 订阅恢复完成 (成功: %d / 总数: %d)", count, len(subs))
+}
+
 func (sm *SubscriptionManager) handleMessage(msg interface{}) {
 	switch v := msg.(type) {
 	case redis.Message:
-		// 检查是否是模式消息
+		// Redigo 中 redis.Message 结构体同时处理普通消息和模式消息
+		// 如果 Pattern 字段不为空，则是 PMessage
 		if v.Pattern != "" {
-			// 这是模式消息
-			key := "pattern:" + v.Pattern
-			sm.mu.RLock()
-			sub, ok := sm.subscriptions[key]
-			sm.mu.RUnlock()
-
-			if ok && sub.IsActive() && sub.Handler != nil {
-				// 对于模式消息，传递实际的频道名和消息内容
-				go sm.safeHandleMessage(sub.Handler, v.Channel, string(v.Data))
-			}
+			sm.dispatchPatternMessage(v)
 		} else {
-			// 这是普通频道消息
-			key := "channel:" + v.Channel
-			sm.mu.RLock()
-			sub, ok := sm.subscriptions[key]
-			sm.mu.RUnlock()
-
-			if ok && sub.IsActive() && sub.Handler != nil {
-				go sm.safeHandleMessage(sub.Handler, v.Channel, string(v.Data))
-			}
+			sm.dispatch(v.Channel, string(v.Data), false)
 		}
-
 	case redis.Subscription:
-		log.Printf("订阅状态: %s %s (count: %d)", v.Kind, v.Channel, v.Count)
-
+		// 订阅/退订成功通知，一般忽略
 	case redis.Pong:
-		log.Println("收到 Pong 消息")
-
-	case error:
-		if isNetworkError(v) {
-			log.Printf("订阅连接错误: %v", v)
-			sm.handleConnectionError(v)
-		} else {
-			log.Printf("订阅其他错误: %v", v)
-		}
-
-	default:
-		if sm.tryHandlePatternMessage(msg) {
-			return
-		}
-		log.Printf("收到未知类型消息: %T %+v", msg, msg)
+		// 心跳响应，忽略
 	}
 }
 
-// 尝试处理模式消息
-func (sm *SubscriptionManager) tryHandlePatternMessage(msg interface{}) bool {
-	// 处理 Redis 的原生模式消息结构
-	if arr, ok := msg.([]interface{}); ok && len(arr) >= 4 {
-		if msgType, ok := arr[0].([]byte); ok && string(msgType) == "pmessage" {
-			if pattern, ok := arr[1].([]byte); ok {
-				if channel, ok := arr[2].([]byte); ok {
-					if data, ok := arr[3].([]byte); ok {
-						sm.handlePatternMessage(string(pattern), string(channel), string(data))
-						return true
-					}
-				}
-			}
-		}
+func (sm *SubscriptionManager) dispatch(key string, data string, isPattern bool) {
+	lookupKey := "channel:" + key
+	if isPattern {
+		lookupKey = "pattern:" + key
 	}
 
-	if msgMap, ok := msg.(map[string]interface{}); ok {
-		if msgType, exists := msgMap["type"]; exists && msgType == "pmessage" {
-			pattern, _ := msgMap["pattern"].(string)
-			channel, _ := msgMap["channel"].(string)
-			data, _ := msgMap["data"].(string)
-			if pattern != "" && channel != "" {
-				sm.handlePatternMessage(pattern, channel, data)
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// 处理模式消息
-func (sm *SubscriptionManager) handlePatternMessage(pattern, channel, message string) {
-	key := "pattern:" + pattern
-	sm.mu.RLock()
-	sub, ok := sm.subscriptions[key]
-	sm.mu.RUnlock()
+	sm.subMu.RLock()
+	sub, ok := sm.subscriptions[lookupKey]
+	sm.subMu.RUnlock()
 
 	if ok && sub.IsActive() && sub.Handler != nil {
-		go sm.safeHandleMessage(sub.Handler, channel, message)
+		// 异步执行 Handler，防止用户逻辑阻塞接收循环
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[Redic] Handler panic for %s: %v", key, r)
+				}
+			}()
+			sub.Handler(key, data)
+		}()
 	}
 }
 
-func (sm *SubscriptionManager) safeHandleMessage(handler func(string, string), channel, message string) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("消息处理异常 [%s]: %v", channel, r)
-		}
-	}()
-	handler(channel, message)
+func (sm *SubscriptionManager) dispatchPatternMessage(msg redis.Message) {
+	lookupKey := "pattern:" + msg.Pattern
+
+	sm.subMu.RLock()
+	sub, ok := sm.subscriptions[lookupKey]
+	sm.subMu.RUnlock()
+
+	if ok && sub.IsActive() && sub.Handler != nil {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[Redic] (Pattern) Handler panic: %v", r)
+				}
+			}()
+			// 传回实际 Channel (msg.Channel) 和数据
+			sub.Handler(msg.Channel, string(msg.Data))
+		}()
+	}
 }
 
-func (sm *SubscriptionManager) handleConnectionError(err error) {
+func (sm *SubscriptionManager) Close() {
+	sm.cancel() // 停止接收循环 Context
+
+	// 获取写锁关闭连接
+	// 因为 Receiver 已释放读锁并在网络 IO 上等待，这里能获取到锁并 Close
 	sm.connMu.Lock()
 	if sm.pubsubConn != nil {
-		sm.pubsubConn.Close()
+		sm.pubsubConn.Close() // 这会立即使 Receive 返回错误，协程退出
 		sm.pubsubConn = nil
 	}
 	sm.connMu.Unlock()
 
-	if sm.client != nil {
-		sm.client.handleConnectionError(err)
-	}
-}
+	// 清空本地记录
+	sm.subMu.Lock()
+	sm.subscriptions = make(map[string]*SubscriptionInfo)
+	sm.subMu.Unlock()
 
-// 重新订阅所有频道
-func (sm *SubscriptionManager) ResubscribeAll() error {
-	if !atomic.CompareAndSwapInt32(&sm.resubscribing, 0, 1) {
-		log.Println("重新订阅已在进行中，跳过")
-		return nil
-	}
-	defer atomic.StoreInt32(&sm.resubscribing, 0)
-
-	maxWait := defaultResubscribeMaxWait
-	checkInterval := defaultResubscribeCheckInterval
-
-	for waited := time.Duration(0); waited < maxWait; waited += checkInterval {
-		if sm.client.GetState() == StateConnected {
-			time.Sleep(500 * time.Millisecond)
-			break
-		}
-		time.Sleep(checkInterval)
-	}
-
-	if sm.client.GetState() != StateConnected {
-		return errors.New("连接未稳定，无法重新订阅")
-	}
-
-	log.Println("开始重新订阅所有频道...")
-
-	sm.connMu.Lock()
-	if sm.pubsubConn != nil {
-		sm.pubsubConn.Close()
-		sm.pubsubConn = nil
-	}
-	sm.connMu.Unlock()
-
-	sm.mu.RLock()
-	subscriptions := make([]*SubscriptionInfo, 0, len(sm.subscriptions))
-	for _, sub := range sm.subscriptions {
-		if sub.IsActive() {
-			subscriptions = append(subscriptions, sub)
-		}
-	}
-	sm.mu.RUnlock()
-
-	if len(subscriptions) == 0 {
-		log.Println("没有需要重新订阅的频道")
-		return nil
-	}
-
-	var resubCount int
-	var failedSubs []string
-
-	for _, sub := range subscriptions {
-		var err error
-		for retry := 0; retry < 3; retry++ {
-			if sub.IsPattern {
-				err = sm.doSubscribe(sub.Pattern, true)
-			} else {
-				err = sm.doSubscribe(sub.Channel, false)
-			}
-
-			if err == nil {
-				resubCount++
-				break
-			}
-
-			if retry < 2 {
-				time.Sleep(time.Duration(retry+1) * 500 * time.Millisecond) // 减少重试间隔
-			}
-		}
-
-		if err != nil {
-			failedSubs = append(failedSubs, sub.Key())
-			log.Printf("重新订阅失败 %s: %v", sub.Key(), err)
-		}
-	}
-
-	log.Printf("重新订阅完成，成功: %d, 失败: %d", resubCount, len(failedSubs))
-
-	if len(failedSubs) > 0 {
-		go sm.retryFailedSubscriptions(failedSubs)
-	}
-
-	return nil
-}
-
-func (sm *SubscriptionManager) retryFailedSubscriptions(failedSubs []string) {
-	time.Sleep(5 * time.Second)
-
-	for _, key := range failedSubs {
-		sm.mu.RLock()
-		sub, ok := sm.subscriptions[key]
-		sm.mu.RUnlock()
-
-		if !ok || !sub.IsActive() {
-			continue
-		}
-
-		var err error
-		if sub.IsPattern {
-			err = sm.doSubscribe(sub.Pattern, true)
-		} else {
-			err = sm.doSubscribe(sub.Channel, false)
-		}
-
-		if err == nil {
-			log.Printf("延迟重试订阅成功: %s", key)
-		} else {
-			log.Printf("延迟重试订阅失败: %s - %v", key, err)
-		}
-	}
+	sm.wg.Wait() // 等待接收协程彻底退出
 }
 
 func (sm *SubscriptionManager) GetSubscriptionCount() int {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.subMu.RLock()
+	defer sm.subMu.RUnlock()
 	return len(sm.subscriptions)
 }
 
-func (sm *SubscriptionManager) Close() error {
-	sm.cancel()
+// --------------------------------------------------------------------------------
+// Client (主客户端)
+// --------------------------------------------------------------------------------
 
-	sm.connMu.Lock()
-	if sm.pubsubConn != nil {
-		sm.pubsubConn.Close()
-		sm.pubsubConn = nil
-	}
-	sm.connMu.Unlock()
-
-	sm.wg.Wait()
-
-	// 清理所有订阅
-	sm.mu.Lock()
-	for _, sub := range sm.subscriptions {
-		sub.SetActive(false)
-	}
-	sm.subscriptions = make(map[string]*SubscriptionInfo)
-	sm.mu.Unlock()
-
-	return nil
-}
-
-// Redis客户端
 type Client struct {
-	// 基础配置
 	addr            string
 	password        string
 	database        int
 	reconnectConfig *ReconnectConfig
-
-	// 连接管理
-	pool *redis.Pool
-
-	// 订阅管理
-	subManager *SubscriptionManager
-
-	// 状态管理
-	state int32 // atomic
-
-	// 回调/状态容器
-	mu sync.RWMutex
+	pool            *redis.Pool
+	subManager      *SubscriptionManager
+	state           int32 // atomic
+	reconnectMu     sync.Mutex
 }
 
-// Helper: 判断是否为网络错误
-func isNetworkError(err error) bool {
-	if err == nil {
-		return false
-	}
-	for _, ne := range knownNetworkErrors {
-		if errors.Is(err, ne) {
-			return true
-		}
-	}
-	// 尝试检查 errno
-	var errno syscall.Errno
-	if errors.As(err, &errno) {
-		if _, ok := networkSyscallErrnos[errno]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-// 颜色辅助：判断是否为非配置信息中需要忽略的错误
-func ignoreNonNetworkError(err error) bool {
-	for _, ne := range nonNetworkErrors {
-		if errors.Is(err, ne) {
-			return true
-		}
-	}
-	return false
-}
-
-// 构造新的客户端
 func NewClient(addr string, password string, db int, cfg *ReconnectConfig) *Client {
 	if cfg == nil {
 		cfg = DefaultReconnectConfig()
 	}
-	// 初始化连接池
 	pool := &redis.Pool{
 		MaxIdle:     10,
+		MaxActive:   100, // 充足的连接数防止阻塞
+		Wait:        true,
 		IdleTimeout: 240 * time.Second,
 		Dial: func() (redis.Conn, error) {
-			options := []redis.DialOption{
+			opts := []redis.DialOption{
 				redis.DialConnectTimeout(5 * time.Second),
 				redis.DialReadTimeout(5 * time.Second),
 				redis.DialWriteTimeout(5 * time.Second),
+				redis.DialDatabase(db),
 			}
 			if password != "" {
-				options = append(options, redis.DialPassword(password))
+				opts = append(opts, redis.DialPassword(password))
 			}
-			// 指定数据库
-			options = append(options, redis.DialDatabase(db))
-			return redis.Dial("tcp", addr, options...)
+			return redis.Dial("tcp", addr, opts...)
 		},
 		TestOnBorrow: func(c redis.Conn, t time.Time) error {
+			if time.Since(t) < time.Minute {
+				return nil
+			}
 			_, err := c.Do("PING")
 			return err
 		},
 	}
+
 	c := &Client{
 		addr:            addr,
 		password:        password,
@@ -648,204 +555,224 @@ func NewClient(addr string, password string, db int, cfg *ReconnectConfig) *Clie
 		pool:            pool,
 		state:           int32(StateDisconnected),
 	}
-	c.subManager = NewSubscriptionManager(c.pool, c)
+	c.subManager = NewSubscriptionManager(pool, c)
 	return c
 }
 
-// 连接到 Redis，验证连通性并触发就绪状态
+// Connect 首次连接
 func (c *Client) Connect() error {
-	atomic.StoreInt32(&c.state, int32(StateConnecting))
-	// 回调：正在连接
-	if c.reconnectConfig != nil && c.reconnectConfig.OnConnecting != nil {
+	if c.reconnectConfig.OnConnecting != nil {
 		c.reconnectConfig.OnConnecting()
 	}
-	conn := c.pool.Get()
-	if conn == nil {
-		atomic.StoreInt32(&c.state, int32(StateDisconnected))
-		return errors.New("failed to obtain Redis connection")
-	}
-	defer conn.Close()
 
+	conn := c.pool.Get()
 	_, err := conn.Do("PING")
+	conn.Close()
+
 	if err != nil {
-		atomic.StoreInt32(&c.state, int32(StateDisconnected))
-		// 启动重连循环
-		c.startReconnectionLoop(err)
+		// 初始连接失败，立即转入重连流程
+		log.Printf("[Redic] 初始连接失败: %v, 启动后台重连...", err)
+		atomic.StoreInt32(&c.state, int32(StateReconnecting))
+		if c.reconnectConfig.OnDisconnected != nil {
+			c.reconnectConfig.OnDisconnected(err)
+		}
+		go c.reconnectionLoop()
 		return err
 	}
 
 	atomic.StoreInt32(&c.state, int32(StateConnected))
-	if c.reconnectConfig != nil && c.reconnectConfig.OnConnected != nil {
+	if c.reconnectConfig.OnConnected != nil {
 		c.reconnectConfig.OnConnected()
 	}
+
+	log.Printf("[Redic] 成功连接到 Redis: %s (db=%d)", c.addr, c.database)
 	return nil
 }
 
-// 内部：启动重连循环
-func (c *Client) startReconnectionLoop(firstErr error) {
+func (c *Client) Close() error {
+	// CAS 确保不再触发重连
+	oldState := atomic.SwapInt32(&c.state, int32(StateDisconnected))
+	if oldState == int32(StateDisconnected) {
+		return nil
+	}
+
+	c.subManager.Close()
+	return c.pool.Close()
+}
+
+// --------------------------------------------------------------------------------
+// 重连逻辑
+// --------------------------------------------------------------------------------
+
+func (c *Client) triggerReconnect(err error) {
+	current := atomic.LoadInt32(&c.state)
+
+	// 如果被人工关闭，不重连
+	if current == int32(StateDisconnected) {
+		return
+	}
+	// 如果已经在重连中，不重复触发
+	if current == int32(StateReconnecting) {
+		return
+	}
+
+	// 尝试切换到 Reconnecting
+	if atomic.CompareAndSwapInt32(&c.state, current, int32(StateReconnecting)) {
+		log.Printf("[Redic] 连接异常 (%v)，触发重连流程...", err)
+		if c.reconnectConfig.OnDisconnected != nil {
+			c.reconnectConfig.OnDisconnected(err)
+		}
+		go c.reconnectionLoop()
+	}
+}
+
+func (c *Client) reconnectionLoop() {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
 	cfg := c.reconnectConfig
-	if cfg == nil {
-		return
-	}
-	// 防御性：如果已经在连接状态，直接返回
-	if atomic.LoadInt32(&c.state) == int32(StateConnected) {
-		return
-	}
+	attempt := 0
+	delay := cfg.InitialDelay
 
-	go func() {
-		attempt := 0
-		delay := cfg.InitialDelay
-		for {
-			// 达到最大重试次数时放弃
-			if cfg.MaxRetries >= 0 && attempt >= cfg.MaxRetries {
-				atomic.StoreInt32(&c.state, int32(StateFailed))
-				if cfg.OnGiveUp != nil {
-					cfg.OnGiveUp(errors.New("max reconnect attempts reached"))
-				}
-				return
+	for {
+		// 每次循环前检查是否被外部关闭
+		if c.GetState() == StateDisconnected {
+			return
+		}
+
+		// [修复逻辑判断]
+		// 这里必须使用 > (大于)，而不是 >= (大于等于)。
+		// 只有当尝试次数严格超过设定值时才放弃。
+		// 例如 MaxRetries=3，允许 attempt 0, 1, 2, 3 共4次。
+		if cfg.MaxRetries >= 0 && attempt > cfg.MaxRetries {
+			atomic.StoreInt32(&c.state, int32(StateFailed))
+			log.Printf("[Redic] 达到最大重试次数 (%d)，放弃重连", cfg.MaxRetries)
+			if cfg.OnGiveUp != nil {
+				cfg.OnGiveUp(errors.New("max retries reached"))
 			}
-			// 回调：重新连接
-			if cfg.OnReconnecting != nil {
-				cfg.OnReconnecting(attempt)
+			return
+		}
+
+		if cfg.OnReconnecting != nil {
+			cfg.OnReconnecting(attempt)
+		}
+
+		if c.tryPing() {
+			log.Printf("[Redic] 重连成功 (第 %d 次尝试)", attempt+1)
+			atomic.StoreInt32(&c.state, int32(StateConnected))
+
+			// 1. 恢复订阅
+			go c.subManager.ResubscribeAll()
+
+			// 2. 回调
+			if cfg.OnReconnected != nil {
+				cfg.OnReconnected(attempt)
 			}
-			// 等待
+			return
+		}
+
+		// 失败，增加计数
+		attempt++
+
+		// 等待逻辑
+		// 只要还没到放弃的条件，就进行等待
+		if cfg.MaxRetries < 0 || attempt <= cfg.MaxRetries {
 			time.Sleep(delay)
-
-			// 尝试重新连接
-			if c.tryReconnect() {
-				atomic.StoreInt32(&c.state, int32(StateConnected))
-				if cfg.OnReconnected != nil {
-					cfg.OnReconnected(attempt)
-				}
-				return
+			
+			// 计算下次等待时间
+			delay = time.Duration(float64(delay) * cfg.BackoffMultiplier)
+			if delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
 			}
-			// 失败后调整延迟
-			attempt++
-			// 退避策略与抖动
 			if cfg.Jitter {
-				j := time.Duration(rand.Int63n(int64(100))) * time.Millisecond
-				delay = time.Duration(float64(delay) * cfg.BackoffMultiplier)
-				if delay > cfg.MaxDelay {
-					delay = cfg.MaxDelay
-				}
-				delay += j
-			} else {
-				delay = time.Duration(float64(delay) * cfg.BackoffMultiplier)
-				if delay > cfg.MaxDelay {
-					delay = cfg.MaxDelay
-				}
+				delay += time.Duration(rand.Int63n(1000)) * time.Millisecond
 			}
 		}
-	}()
+	}
 }
 
-// 尝试进行一次重新连接检查
-func (c *Client) tryReconnect() bool {
-	// 使用现有的 pool 进行一次轻量的 PING
+func (c *Client) tryPing() bool {
 	conn := c.pool.Get()
-	if conn == nil {
-		return false
-	}
 	defer conn.Close()
-
 	_, err := conn.Do("PING")
-	if err != nil {
-		return false
-	}
-	// 成功后，尝试重新订阅/恢复状态
-	if c.subManager != nil {
-		_ = c.subManager.ResubscribeAll()
-	}
-	return true
+	return err == nil
 }
 
-// 获取当前状态
 func (c *Client) GetState() ConnectionState {
 	return ConnectionState(atomic.LoadInt32(&c.state))
 }
 
-// 关闭客户端
-func (c *Client) Close() error {
-	// 更新状态为断开连接
-	atomic.StoreInt32(&c.state, int32(StateDisconnected))
+// --------------------------------------------------------------------------------
+// 对外 API 命令封装
+// --------------------------------------------------------------------------------
 
-	if c.subManager != nil {
-		_ = c.subManager.Close()
-	}
-	if c.pool != nil {
-		return c.pool.Close()
-	}
-	return nil
-}
-
-func (c *Client) Subscribe(channel string, handler func(channel, message string)) error {
-	if c.subManager == nil {
-		c.subManager = NewSubscriptionManager(c.pool, c)
-	}
+func (c *Client) Subscribe(channel string, handler func(ch, msg string)) error {
 	return c.subManager.Subscribe(channel, handler)
 }
 
-func (c *Client) PSubscribe(pattern string, handler func(channel, message string)) error {
-	if c.subManager == nil {
-		c.subManager = NewSubscriptionManager(c.pool, c)
-	}
+func (c *Client) PSubscribe(pattern string, handler func(ch, msg string)) error {
 	return c.subManager.PSubscribe(pattern, handler)
 }
 
 func (c *Client) Unsubscribe(channels ...string) error {
-	if c.subManager == nil {
-		return nil
-	}
 	return c.subManager.Unsubscribe(channels...)
 }
 
 func (c *Client) PUnsubscribe(patterns ...string) error {
-	if c.subManager == nil {
-		return nil
-	}
 	return c.subManager.PUnsubscribe(patterns...)
 }
 
 func (c *Client) Publish(channel string, message interface{}) error {
 	conn := c.pool.Get()
-	if conn == nil {
-		return errors.New("no available redis connection")
-	}
 	defer conn.Close()
-
 	_, err := conn.Do("PUBLISH", channel, message)
+	if err != nil && isNetworkError(err) {
+		go c.triggerReconnect(err)
+	}
 	return err
 }
 
 func (c *Client) Get(key string) (string, error) {
 	conn := c.pool.Get()
-	if conn == nil {
-		return "", errors.New("no available redis connection")
-	}
 	defer conn.Close()
-
-	return redis.String(conn.Do("GET", key))
+	res, err := redis.String(conn.Do("GET", key))
+	if err != nil && isNetworkError(err) {
+		go c.triggerReconnect(err)
+	}
+	return res, err
 }
 
 func (c *Client) Set(key string, value interface{}) error {
 	conn := c.pool.Get()
-	if conn == nil {
-		return errors.New("no available redis connection")
-	}
 	defer conn.Close()
-
 	_, err := conn.Do("SET", key, value)
+	if err != nil && isNetworkError(err) {
+		go c.triggerReconnect(err)
+	}
 	return err
 }
 
-func (c *Client) Send(channel string, payload interface{}) error {
-	return c.Publish(channel, payload)
-}
-
-func (c *Client) handleConnectionError(err error) {
-	if c.reconnectConfig != nil && c.reconnectConfig.OnDisconnected != nil {
-		c.reconnectConfig.OnDisconnected(err)
+// isNetworkError 判断是否为网络层错误（需要重连）
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
 	}
-	atomic.StoreInt32(&c.state, int32(StateDisconnected))
-	c.startReconnectionLoop(err)
+	// 检查预定义错误列表
+	for _, ne := range knownNetworkErrors {
+		if errors.Is(err, ne) {
+			return true
+		}
+	}
+	// 检查系统底层错误
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if _, ok := networkSyscallErrnos[errno]; ok {
+			return true
+		}
+	}
+	// 还可以检查是否实现了 Timeout 接口（部分网络错误实现了但不在 error list 中）
+	if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+		return true // 超时通常也视为网络不稳定
+	}
+	return false
 }
