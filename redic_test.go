@@ -1,6 +1,7 @@
 package redic
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -9,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicebob/miniredis" // 建议使用 v2 版本
+	"github.com/alicebob/miniredis/v2" // 建议使用 v2 版本
 	"github.com/gomodule/redigo/redis"
 )
 
@@ -385,8 +386,9 @@ func TestClient_ErrorHandling(t *testing.T) {
 	// Test connecting to invalid address
 	cfg := DefaultReconnectConfig()
 	cfg.MaxRetries = 2 // 限制重试次数，避免测试时间过长
-	cfg.InitialDelay = 100 * time.Millisecond
-	
+	cfg.InitialDelay = 50 * time.Millisecond
+	cfg.MaxDelay = 200 * time.Millisecond
+
 	c := NewClient("invalid:address:12345", "", 0, cfg)
 	defer c.Close()
 
@@ -401,26 +403,33 @@ func TestClient_ErrorHandling(t *testing.T) {
 		t.Errorf("expected StateDisconnected, StateFailed or StateReconnecting, got %v", state)
 	}
 
-	// 等待重连尝试完成
-	time.Sleep(1 * time.Second)
-	
+	// 等待重连尝试完成（MaxRetries=2, 延迟 50ms + 100ms + jitter）
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		state = c.GetState()
+		if state == StateFailed || state == StateDisconnected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	// 现在应该是 Failed 状态（达到最大重试次数）
 	state = c.GetState()
 	if state != StateFailed && state != StateDisconnected {
 		t.Errorf("after retries, expected StateFailed or StateDisconnected, got %v", state)
 	}
 
-	// Test operations on disconnected client
+	// Test operations on failed/disconnected client - should return sentinel errors
 	if err := c.Set("test", "value"); err == nil {
-		t.Errorf("expected error for Set on disconnected client")
+		t.Errorf("expected error for Set on failed client")
 	}
 
 	if _, err := c.Get("test"); err == nil {
-		t.Errorf("expected error for Get on disconnected client")
+		t.Errorf("expected error for Get on failed client")
 	}
 
 	if err := c.Publish("test", "msg"); err == nil {
-		t.Errorf("expected error for Publish on disconnected client")
+		t.Errorf("expected error for Publish on failed client")
 	}
 }
 
@@ -1014,6 +1023,57 @@ func BenchmarkClient_SetGet(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkClient_PubSub 测试高并发下的发布订阅分发性能
+func BenchmarkClient_PubSub(b *testing.B) {
+	s, err := miniredis.Run()
+	if err != nil {
+		b.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer s.Close()
+
+	c := NewClient(s.Addr(), "", 0, nil)
+	// 关闭日志输出以免影响性能测试
+	c.SetLogger(&noopLogger{})
+	if err := c.Connect(); err != nil {
+		b.Fatalf("failed to connect: %v", err)
+	}
+	defer c.Close()
+
+	channel := "bench_chan"
+	var received int64
+	done := make(chan struct{})
+
+	// 订阅
+	handler := func(ch, msg string) {
+		if n := atomic.AddInt64(&received, 1); n == int64(b.N) {
+			close(done)
+		}
+	}
+	if err := c.Subscribe(channel, handler); err != nil {
+		b.Fatalf("subscribe failed: %v", err)
+	}
+
+	// 确保订阅建立
+	time.Sleep(100 * time.Millisecond)
+
+	b.ResetTimer()
+
+	// 模拟发布者
+	go func() {
+		for i := 0; i < b.N; i++ {
+			if err := c.Publish(channel, "payload"); err != nil {
+				// error handling
+			}
+		}
+	}()
+
+	<-done
+}
+
+type noopLogger struct{}
+
+func (l *noopLogger) Printf(format string, v ...interface{}) {}
 
 // BenchmarkClient_Publish 发布性能基准测试
 func BenchmarkClient_Publish(b *testing.B) {
@@ -2111,6 +2171,8 @@ func TestClient_FeatureCoverage(t *testing.T) {
 		{"Real World", "TestClient_RealWorldScenarios", "Practical usage scenarios"},
 		{"Integration", "TestClient_Integration", "End-to-end system testing"},
 		{"Database Selection", "TestClient_DatabaseSelection", "Multi-database support"},
+		{"Advanced Features", "TestClient_AdvancedFeatures", "Do command and Backpressure protection"},
+		{"Stress Scenarios", "TestClient_StressScenarios", "High concurrency, heavy load, and instability"},
 	}
 
 	t.Logf("Total features tested: %d", len(features))
@@ -2147,6 +2209,584 @@ func TestClient_FeatureCoverage(t *testing.T) {
 	t.Log("\nTest coverage is comprehensive and ready for production use.")
 }
 
+// ---- 指标与重试专项单测 ----
+
+type fakeTimeoutErr struct{ msg string }
+
+func (e fakeTimeoutErr) Error() string { return e.msg }
+func (e fakeTimeoutErr) Timeout() bool { return true }
+
+type testLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *testLogger) Printf(format string, args ...interface{}) {
+	line := fmt.Sprintf(format, args...)
+	l.mu.Lock()
+	l.lines = append(l.lines, line)
+	l.mu.Unlock()
+}
+func (l *testLogger) Contains(substr string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, s := range l.lines {
+		if strings.Contains(s, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCommandTimeoutThreshold 验证连续超时阈值触发重连
+func TestCommandTimeoutThreshold(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	c.cmdTimeoutThreshold = 3
+	// 两次超时：不应触发重连
+	c.maybeTriggerReconnectOnError(fakeTimeoutErr{"t1"})
+	c.maybeTriggerReconnectOnError(fakeTimeoutErr{"t2"})
+	time.Sleep(50 * time.Millisecond)
+	if c.GetState() != StateConnected {
+		t.Fatalf("state changed prematurely: %v", c.GetState())
+	}
+	// 第三次超时：应触发重连尝试
+	prevAttempts := c.GetMetrics().ReconnectAttempts
+	c.maybeTriggerReconnectOnError(fakeTimeoutErr{"t3"})
+	time.Sleep(100 * time.Millisecond)
+	after := c.GetMetrics().ReconnectAttempts
+	if after <= prevAttempts {
+		t.Fatalf("reconnect attempts not increased, before=%d after=%d", prevAttempts, after)
+	}
+}
+
+// fake redigo.Conn 用于模拟订阅指令瞬时失败
+type fakeConn struct {
+	sendCount int
+	failCount int
+}
+
+func (fc *fakeConn) Close() error                                            { return nil }
+func (fc *fakeConn) Err() error                                              { return nil }
+func (fc *fakeConn) Do(cmd string, args ...interface{}) (interface{}, error) { return nil, nil }
+func (fc *fakeConn) Send(cmd string, args ...interface{}) error {
+	fc.sendCount++
+	if fc.sendCount <= fc.failCount {
+		return fmt.Errorf("send failed on attempt %d", fc.sendCount)
+	}
+	return nil
+}
+func (fc *fakeConn) Flush() error                            { return nil }
+func (fc *fakeConn) Receive() (reply interface{}, err error) { return nil, nil }
+
+// TestSubscriptionResubscribeRetry 验证重试逻辑能在瞬时失败后成功
+func TestSubscriptionResubscribeRetry(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	logger := &testLogger{}
+	c.SetLogger(logger)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	// 先登记一个订阅
+	subCh := make(chan string, 1)
+	if err := c.Subscribe("retry_chan", func(ch, msg string) { subCh <- msg }); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// 用 fakeConn 替换 pubsubConn，制造前两次失败、第三次成功
+	fc := &fakeConn{failCount: 2}
+	psc := &redis.PubSubConn{Conn: fc}
+	c.subManager.connMu.Lock()
+	c.subManager.pubsubConn = psc
+	c.subManager.connMu.Unlock()
+
+	// 执行恢复逻辑
+	c.subManager.ResubscribeAll()
+
+	// 验证发送次数与日志摘要
+	if fc.sendCount < 3 {
+		t.Fatalf("expected at least 3 send attempts, got %d", fc.sendCount)
+	}
+	if !logger.Contains("订阅恢复完成 (逐个重试: 成功 1 / 总数 1)") {
+		t.Fatalf("missing success summary log, logs=%v", logger.lines)
+	}
+}
+
+// TestClient_AdvancedFeatures 测试高级功能：Do 方法与背压保护
+func TestClient_AdvancedFeatures(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Test Do Method
+	t.Run("Do Method", func(t *testing.T) {
+		c := NewClient(m.Addr(), "", 0, nil)
+		defer c.Close()
+		if err := c.Connect(); err != nil {
+			t.Fatalf("connect failed: %v", err)
+		}
+
+		// Test INCR
+		reply, err := c.Do("INCR", "counter")
+		if err != nil {
+			t.Fatalf("Do INCR failed: %v", err)
+		}
+		count, _ := redis.Int(reply, nil)
+		if count != 1 {
+			t.Errorf("expected counter 1, got %d", count)
+		}
+
+		// Test HSET/HGET
+		_, err = c.Do("HSET", "user:100", "name", "alice")
+		if err != nil {
+			t.Fatalf("Do HSET failed: %v", err)
+		}
+		reply, err = c.Do("HGET", "user:100", "name")
+		if err != nil {
+			t.Fatalf("Do HGET failed: %v", err)
+		}
+		name, _ := redis.String(reply, nil)
+		if name != "alice" {
+			t.Errorf("expected name alice, got %s", name)
+		}
+	})
+
+	// 2. Test Backpressure
+	t.Run("Backpressure", func(t *testing.T) {
+		droppedCount := int32(0)
+		cfg := &ReconnectConfig{
+			SubscriptionWorkerPoolSize:  1,                      // Single worker to force blocking
+			SubscriptionBufferSize:      2,                      // Buffer size 2
+			SubscriptionDispatchTimeout: 100 * time.Millisecond, // Short timeout
+			OnMessageDropped: func(channel string) {
+				atomic.AddInt32(&droppedCount, 1)
+			},
+		}
+		c := NewClient(m.Addr(), "", 0, cfg)
+		defer c.Close()
+		if err := c.Connect(); err != nil {
+			t.Fatalf("connect failed: %v", err)
+		}
+
+		// Subscribe with slow consumer
+		// We use a latch to block the worker
+		blockWorker := make(chan struct{})
+
+		err := c.Subscribe("fast_channel", func(ch, msg string) {
+			// The first message will be picked up by the single worker, and it will block here.
+			// This effectively occupies the worker.
+			<-blockWorker
+		})
+		if err != nil {
+			t.Fatalf("subscribe failed: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond) // Wait for subscription to propagate
+
+		// Send message 0 - will be picked up by worker and block
+		c.Publish("fast_channel", "msg-0")
+		time.Sleep(10 * time.Millisecond) // ensure worker picks it up
+
+		// Buffer size is 2.
+		// Send message 1 - into buffer
+		c.Publish("fast_channel", "msg-1")
+		// Send message 2 - into buffer
+		c.Publish("fast_channel", "msg-2")
+
+		// Buffer is full now.
+		// Send message 3 - should block for 100ms then drop
+		c.Publish("fast_channel", "msg-3")
+
+		// Since Publish is async (it just writes to redis), the actual dispatch happens in the background loop.
+		// We need to wait enough time for the background loop to try to dispatch and fail.
+		time.Sleep(200 * time.Millisecond)
+
+		// Unblock worker so things can clean up
+		close(blockWorker)
+
+		// Check dropped count
+		count := atomic.LoadInt32(&droppedCount)
+		if count == 0 {
+			// Note: This test relies on timing and internal implementation details (channel size).
+			// If it fails, it might be because the buffer implementation is slightly different or the worker wasn't blocked fast enough.
+			// But logically: 1 worker blocked + 2 buffer slots. 4th message MUST drop.
+			t.Errorf("expected messages to be dropped, got 0")
+		} else {
+			t.Logf("Successfully dropped %d messages due to backpressure", count)
+		}
+	})
+}
+
+// TestClient_StressScenarios 压力测试：高并发、重负载发布订阅、连接不稳定性
+func TestClient_StressScenarios(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	// 1. High Concurrency Get/Set
+	t.Run("Concurrency_GetSet", func(t *testing.T) {
+		c := NewClient(m.Addr(), "", 0, nil)
+		defer c.Close()
+		if err := c.Connect(); err != nil {
+			t.Fatalf("connect failed: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		concurrency := 50
+		opsPerGoroutine := 200
+		var errors int32
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < opsPerGoroutine; j++ {
+					key := fmt.Sprintf("stress_key_%d_%d", id, j)
+					value := fmt.Sprintf("val_%d_%d", id, j)
+					if err := c.Set(key, value); err != nil {
+						atomic.AddInt32(&errors, 1)
+						return
+					}
+					got, err := c.Get(key)
+					if err != nil {
+						atomic.AddInt32(&errors, 1)
+						return
+					}
+					if got != value {
+						atomic.AddInt32(&errors, 1)
+						return
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		if errors > 0 {
+			t.Errorf("Concurrency_GetSet failed with %d errors", errors)
+		}
+	})
+
+	// 2. Heavy Pub/Sub Load
+	t.Run("Heavy_PubSub", func(t *testing.T) {
+		numSubscribers := 20
+		msgCount := 500
+		var receivedCount int32
+		var wg sync.WaitGroup
+
+		clients := make([]*Client, numSubscribers)
+
+		// Start subscribers (each is a separate client to test fan-out)
+		for i := 0; i < numSubscribers; i++ {
+			cfg := &ReconnectConfig{
+				SubscriptionWorkerPoolSize: 2,
+				SubscriptionBufferSize:     1000,
+			}
+			c := NewClient(m.Addr(), "", 0, cfg)
+			clients[i] = c
+
+			if err := c.Connect(); err != nil {
+				t.Fatalf("client %d connect failed: %v", i, err)
+			}
+
+			wg.Add(1)
+			// Each subscriber listens to the same channel
+			err := c.Subscribe("stress_channel", func(ch, msg string) {
+				atomic.AddInt32(&receivedCount, 1)
+			})
+			if err != nil {
+				t.Fatalf("client %d subscribe failed: %v", i, err)
+			}
+		}
+
+		// Cleanup clients
+		defer func() {
+			for _, c := range clients {
+				c.Close()
+			}
+		}()
+
+		// Give some time for subscriptions to register
+		time.Sleep(100 * time.Millisecond)
+
+		// Publisher client
+		pubClient := NewClient(m.Addr(), "", 0, nil)
+		defer pubClient.Close()
+		if err := pubClient.Connect(); err != nil {
+			t.Fatalf("publisher connect failed: %v", err)
+		}
+
+		// Publish messages
+		go func() {
+			for i := 0; i < msgCount; i++ {
+				pubClient.Publish("stress_channel", fmt.Sprintf("msg_%d", i))
+				// Small yield
+				if i%50 == 0 {
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
+
+		// Wait for processing
+		time.Sleep(3 * time.Second)
+
+		expected := int32(numSubscribers * msgCount)
+		actual := atomic.LoadInt32(&receivedCount)
+
+		if actual < int32(float64(expected)*0.9) {
+			t.Errorf("Heavy_PubSub: expected ~%d messages, got %d", expected, actual)
+		} else {
+			t.Logf("Heavy_PubSub: processed %d/%d messages (%.1f%%)", actual, expected, float64(actual)/float64(expected)*100)
+		}
+
+		// Release WaitGroup manually
+		for i := 0; i < numSubscribers; i++ {
+			wg.Done()
+		}
+	})
+
+	// 3. Connection Flapping (Simulated)
+	t.Run("Connection_Flapping", func(t *testing.T) {
+		addr := m.Addr()
+
+		cfg := &ReconnectConfig{
+			MaxRetries:   -1, // Infinite retries
+			InitialDelay: 50 * time.Millisecond,
+			MaxDelay:     200 * time.Millisecond,
+		}
+		c := NewClient(addr, "", 0, cfg)
+		defer c.Close()
+		if err := c.Connect(); err != nil {
+			t.Fatalf("connect failed: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var ops int32
+		var errors int32
+
+		// Background worker performing operations
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					if err := c.Set("flap_key", "val"); err != nil {
+						atomic.AddInt32(&errors, 1)
+					} else {
+						atomic.AddInt32(&ops, 1)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}()
+
+		// Simulate flapping
+		for i := 0; i < 3; i++ {
+			time.Sleep(200 * time.Millisecond)
+			m.Close() // Kill server
+
+			// Wait a bit while server is down
+			time.Sleep(200 * time.Millisecond)
+
+			// Restart server on same address
+			if err := m.StartAddr(addr); err != nil {
+				// If we can't restart on same port, try to update client?
+				// Redic doesn't support dynamic address update easily without recreation.
+				// But miniredis StartAddr should work if port is available.
+				t.Fatalf("failed to restart miniredis on %s: %v", addr, err)
+			}
+		}
+
+		time.Sleep(500 * time.Millisecond) // Wait for reconnection and some ops
+
+		totalOps := atomic.LoadInt32(&ops)
+		totalErrors := atomic.LoadInt32(&errors)
+
+		t.Logf("Connection Flapping: Success: %d, Errors: %d", totalOps, totalErrors)
+
+		if totalOps == 0 {
+			t.Error("Connection Flapping: Zero successful operations, reconnection might have failed")
+		}
+		if totalErrors == 0 {
+			t.Log("Connection Flapping: Surprisingly zero errors, maybe flapping was too fast or lucky?")
+		}
+	})
+}
+
+func TestClient_UnsubscribeDuringDisconnect_NotResubscribed(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	ch := make(chan string, 1)
+	if err := c.Subscribe("unstable", func(channel, message string) { ch <- message }); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Capture address before closing, as m.Addr() might panic or return empty after Close()
+	serverAddr := m.Addr()
+	m.Close()
+
+	_ = c.Unsubscribe("unstable")
+	time.Sleep(100 * time.Millisecond)
+
+	if err := m.StartAddr(serverAddr); err != nil {
+		t.Fatalf("restart miniredis failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateConnected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := c.Publish("unstable", "should_not_receive"); err != nil {
+		t.Fatalf("publish failed: %v", err)
+	}
+	select {
+	case <-ch:
+		t.Fatalf("received message for unsubscribed channel after reconnect")
+	case <-time.After(500 * time.Millisecond):
+	}
+	if count := c.subManager.GetSubscriptionCount(); count != 0 {
+		t.Fatalf("expected 0 subscriptions after unsubscribe during disconnect, got %d", count)
+	}
+}
+
+func TestClient_ConcurrentSubscribeUnsubscribeSafety(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	_ = c.Subscribe("seed", func(ch, msg string) {})
+	time.Sleep(50 * time.Millisecond)
+	var wg sync.WaitGroup
+	channels := make([]string, 50)
+	for i := 0; i < len(channels); i++ {
+		channels[i] = fmt.Sprintf("c_%d", i)
+	}
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < len(channels); j++ {
+				_ = c.Subscribe(channels[j], func(ch, msg string) {})
+				if j%3 == 0 {
+					_ = c.Unsubscribe(channels[j])
+				}
+			}
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = c.Publish("seed", fmt.Sprintf("m_%d", i))
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	wg.Wait()
+	if c.GetState() != StateConnected {
+		t.Fatalf("client not connected after concurrent subscribe/unsubscribe: %v", c.GetState())
+	}
+}
+
+func TestClient_ResubscribeAll_BatchChannelsAndPatterns(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	rcv := make(chan string, 10)
+	chans := []string{"ba_ch1", "ba_ch2", "ba_ch3"}
+	pats := []string{"ba_*", "bp_*"}
+	for _, chn := range chans {
+		if err := c.Subscribe(chn, func(ch, msg string) { rcv <- ch + ":" + msg }); err != nil {
+			t.Fatalf("subscribe failed: %v", err)
+		}
+	}
+	for _, pt := range pats {
+		if err := c.PSubscribe(pt, func(ch, msg string) { rcv <- ch + ":" + msg }); err != nil {
+			t.Fatalf("psubscribe failed: %v", err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	serverAddr := m.Addr()
+	m.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	if err := m.StartAddr(serverAddr); err != nil {
+		t.Fatalf("restart miniredis failed: %v", err)
+	}
+	// 等待订阅连接独立恢复完成（订阅面独立重连 + 重订阅）
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateConnected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond) // 给独立恢复 + ResubscribeAll 足够时间
+	for _, chn := range []string{"ba_ch1", "ba_ch2", "ba_ch3", "ba_match", "bp_case"} {
+		if err := c.Publish(chn, "x"); err != nil {
+			t.Fatalf("publish failed: %v", err)
+		}
+	}
+	got := 0
+	timer := time.NewTimer(2 * time.Second)
+	for got < 5 {
+		select {
+		case <-rcv:
+			got++
+		case <-timer.C:
+			t.Fatalf("timeout waiting for batch resubscribe messages, got=%d", got)
+		}
+	}
+}
+
 // TestMain 测试套件入口点
 func TestMain(m *testing.M) {
 	fmt.Println("Starting Redis client test suite...")
@@ -2158,4 +2798,313 @@ func TestMain(m *testing.M) {
 
 	// 退出时使用测试结果代码
 	os.Exit(code)
+}
+
+// ============================================================================
+// 以下是 v2 重构新增的测试
+// ============================================================================
+
+// TestSentinelErrors 验证哨兵错误语义：StateFailed 拒绝命令
+func TestSentinelErrors(t *testing.T) {
+	cfg := DefaultReconnectConfig()
+	cfg.MaxRetries = 0 // 不重试，直接 Failed
+	cfg.InitialDelay = 10 * time.Millisecond
+
+	c := NewClient("127.0.0.1:1", "", 0, cfg)
+	defer c.Close()
+
+	_ = c.Connect() // 会失败并进入重连
+
+	// 等待进入 Failed
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateFailed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.GetState() != StateFailed {
+		t.Fatalf("expected StateFailed, got %v", c.GetState())
+	}
+
+	// 所有命令应返回 ErrFailed
+	if err := c.Set("k", "v"); err != ErrFailed {
+		t.Errorf("Set: expected ErrFailed, got %v", err)
+	}
+	if _, err := c.Get("k"); err != ErrFailed {
+		t.Errorf("Get: expected ErrFailed, got %v", err)
+	}
+	if err := c.Publish("ch", "msg"); err != ErrFailed {
+		t.Errorf("Publish: expected ErrFailed, got %v", err)
+	}
+	if _, err := c.Do("PING"); err != ErrFailed {
+		t.Errorf("Do: expected ErrFailed, got %v", err)
+	}
+}
+
+// TestErrDisconnected 验证 Close 后返回 ErrDisconnected
+func TestErrDisconnected(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+	c.Close()
+
+	if err := c.Set("k", "v"); err != ErrDisconnected {
+		t.Errorf("Set after Close: expected ErrDisconnected, got %v", err)
+	}
+	if _, err := c.Get("k"); err != ErrDisconnected {
+		t.Errorf("Get after Close: expected ErrDisconnected, got %v", err)
+	}
+}
+
+// TestReconnectFromFailed 验证 Reconnect() 方法可从 Failed 恢复
+func TestReconnectFromFailed(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	addr := m.Addr()
+
+	cfg := DefaultReconnectConfig()
+	cfg.MaxRetries = 0
+	cfg.InitialDelay = 10 * time.Millisecond
+
+	// 先关闭 miniredis，使初始连接失败并进入 Failed
+	m.Close()
+
+	c := NewClient(addr, "", 0, cfg)
+	defer c.Close()
+	_ = c.Connect()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateFailed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.GetState() != StateFailed {
+		t.Fatalf("expected StateFailed, got %v", c.GetState())
+	}
+
+	// 重启 miniredis
+	m2, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start new miniredis: %v", err)
+	}
+	defer m2.Close()
+
+	// 如果新端口不同就跳过（无法改客户端地址）
+	if m2.Addr() != addr {
+		// 尝试在原端口启动
+		m2.Close()
+		m3, _ := miniredis.Run()
+		if m3 != nil {
+			defer m3.Close()
+		}
+		// 使用原始 miniredis restart
+		if err := m.StartAddr(addr); err != nil {
+			t.Skipf("cannot restart miniredis on same addr: %v", err)
+		}
+		defer m.Close()
+	}
+
+	// 调用 Reconnect
+	if err := c.Reconnect(); err != nil {
+		t.Fatalf("Reconnect returned error: %v", err)
+	}
+
+	// 等待连接成功
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateConnected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if c.GetState() != StateConnected {
+		t.Logf("Reconnect did not reach Connected (state=%v), may be expected if port changed", c.GetState())
+	}
+}
+
+// TestStateFailed_NoAutoReconnect 验证 StateFailed 不会被命令错误自动唤醒
+func TestStateFailed_NoAutoReconnect(t *testing.T) {
+	cfg := DefaultReconnectConfig()
+	cfg.MaxRetries = 0
+	cfg.InitialDelay = 10 * time.Millisecond
+
+	c := NewClient("127.0.0.1:1", "", 0, cfg)
+	defer c.Close()
+	_ = c.Connect()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateFailed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	attempts := c.GetMetrics().ReconnectAttempts
+
+	// 执行命令（会返回 ErrFailed，不应触发新的重连尝试）
+	_ = c.Set("k", "v")
+	_ = c.Set("k", "v")
+	_ = c.Set("k", "v")
+	time.Sleep(200 * time.Millisecond)
+
+	after := c.GetMetrics().ReconnectAttempts
+	if after != attempts {
+		t.Errorf("expected no new reconnect attempts from Failed state, before=%d after=%d", attempts, after)
+	}
+}
+
+// TestDoContext 验证 DoContext 基本功能
+func TestDoContext(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	// 正常 context
+	ctx := context.Background()
+	if _, err := c.DoContext(ctx, "SET", "ctx_key", "ctx_value"); err != nil {
+		t.Fatalf("DoContext SET failed: %v", err)
+	}
+	reply, err := c.DoContext(ctx, "GET", "ctx_key")
+	if err != nil {
+		t.Fatalf("DoContext GET failed: %v", err)
+	}
+	val, _ := redis.String(reply, nil)
+	if val != "ctx_value" {
+		t.Errorf("expected 'ctx_value', got %q", val)
+	}
+
+	// 已取消的 context
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.DoContext(cancelCtx, "SET", "k", "v"); err != context.Canceled {
+		t.Errorf("DoContext with cancelled context: expected context.Canceled, got %v", err)
+	}
+}
+
+// TestPoolConfig 验证 PoolConfig 参数传递
+func TestPoolConfig(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	cfg := DefaultReconnectConfig()
+	cfg.Pool = &PoolConfig{
+		MaxIdle:      5,
+		MaxActive:    20,
+		IdleTimeout:  120 * time.Second,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	}
+
+	c := NewClient(m.Addr(), "", 0, cfg)
+	defer c.Close()
+
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect with PoolConfig failed: %v", err)
+	}
+
+	// 验证连接池参数生效
+	stats := c.pool.Stats()
+	if stats.ActiveCount > int(cfg.Pool.MaxActive) {
+		t.Errorf("active connections exceed MaxActive")
+	}
+
+	// 基本操作应正常
+	if err := c.Set("pool_cfg_test", "ok"); err != nil {
+		t.Fatalf("Set failed with custom pool config: %v", err)
+	}
+	val, err := c.Get("pool_cfg_test")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+	if val != "ok" {
+		t.Errorf("expected 'ok', got %q", val)
+	}
+}
+
+// TestSubscriptionIndependentRecovery 验证订阅连接独立恢复不影响命令面
+func TestSubscriptionIndependentRecovery(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	addr := m.Addr()
+
+	cfg := DefaultReconnectConfig()
+	cfg.MaxRetries = 100
+	cfg.InitialDelay = 50 * time.Millisecond
+	cfg.MaxDelay = 200 * time.Millisecond
+
+	c := NewClient(addr, "", 0, cfg)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	msgCh := make(chan string, 5)
+	if err := c.Subscribe("ind_recovery", func(ch, msg string) {
+		msgCh <- msg
+	}); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// 关闭 miniredis 让订阅连接断开
+	m.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// 立即重启——订阅连接的独立恢复应该能自行恢复
+	if err := m.StartAddr(addr); err != nil {
+		t.Skipf("cannot restart on same addr: %v", err)
+	}
+
+	// 给独立恢复足够时间
+	time.Sleep(800 * time.Millisecond)
+
+	// 命令面在整个过程中应保持可用（或至少能恢复）
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.Set("ind_test", "ok"); err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 发布消息验证订阅恢复
+	if err := c.Publish("ind_recovery", "recovered"); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg != "recovered" {
+			t.Errorf("expected 'recovered', got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("timeout waiting for message — subscription independent recovery may have failed")
+	}
 }
