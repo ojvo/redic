@@ -2,7 +2,9 @@ package redic
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -2784,6 +2786,710 @@ func TestClient_ResubscribeAll_BatchChannelsAndPatterns(t *testing.T) {
 		case <-timer.C:
 			t.Fatalf("timeout waiting for batch resubscribe messages, got=%d", got)
 		}
+	}
+}
+
+// ============================================================================
+// SubscribeWithOptions / Adapter 测试
+// ============================================================================
+
+// TestSubscribeWithOptions_Ordered 验证 Ordered 模式严格保序
+func TestSubscribeWithOptions_Ordered(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	var received []string
+	var mu sync.Mutex
+	done := make(chan struct{})
+	count := 50
+
+	err = c.SubscribeWithOptions("ordered_test", func(ch, msg string) {
+		mu.Lock()
+		received = append(received, msg)
+		if len(received) == count {
+			close(done)
+		}
+		mu.Unlock()
+	}, SubscribeOptions{Ordered: true})
+	if err != nil {
+		t.Fatalf("SubscribeWithOptions failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	for i := 0; i < count; i++ {
+		if err := c.Publish("ordered_test", fmt.Sprintf("%d", i)); err != nil {
+			t.Fatalf("publish %d failed: %v", i, err)
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		t.Fatalf("timeout: received %d/%d messages", len(received), count)
+		mu.Unlock()
+	}
+
+	// 验证严格顺序
+	mu.Lock()
+	defer mu.Unlock()
+	for i, msg := range received {
+		expected := fmt.Sprintf("%d", i)
+		if msg != expected {
+			t.Fatalf("ordering broken at %d: expected %q, got %q", i, expected, msg)
+		}
+	}
+}
+
+// TestSubscribeWithOptions_Concurrent 验证默认并发模式正常收消息
+func TestSubscribeWithOptions_Concurrent(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	var count int32
+	total := 20
+	done := make(chan struct{})
+
+	err = c.SubscribeWithOptions("concurrent_test", func(ch, msg string) {
+		if int(atomic.AddInt32(&count, 1)) == total {
+			close(done)
+		}
+	}, SubscribeOptions{Ordered: false})
+	if err != nil {
+		t.Fatalf("SubscribeWithOptions failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	for i := 0; i < total; i++ {
+		if err := c.Publish("concurrent_test", fmt.Sprintf("msg_%d", i)); err != nil {
+			t.Fatalf("publish failed: %v", err)
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout: received %d/%d", atomic.LoadInt32(&count), total)
+	}
+}
+
+// TestPSubscribeWithOptions_Ordered 验证 Ordered 模式的模式订阅
+func TestPSubscribeWithOptions_Ordered(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	msgCh := make(chan string, 10)
+	err = c.PSubscribeWithOptions("popt_*", func(ch, msg string) {
+		msgCh <- ch + ":" + msg
+	}, SubscribeOptions{Ordered: true})
+	if err != nil {
+		t.Fatalf("PSubscribeWithOptions failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := c.Publish("popt_foo", "hello"); err != nil {
+		t.Fatalf("publish failed: %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg != "popt_foo:hello" {
+			t.Errorf("expected 'popt_foo:hello', got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for pattern message")
+	}
+}
+
+// TestSubscribeWithOptions_NilHandler 验证 nil handler 返回错误
+func TestSubscribeWithOptions_NilHandler(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	err = c.SubscribeWithOptions("test", nil, SubscribeOptions{Ordered: true})
+	if err == nil {
+		t.Fatal("expected error for nil handler")
+	}
+
+	err = c.PSubscribeWithOptions("test_*", nil, SubscribeOptions{})
+	if err == nil {
+		t.Fatal("expected error for nil handler")
+	}
+}
+
+// TestAdapter 验证 Adapter 接口基本功能
+func TestAdapter(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	adapter := NewAdapter(m.Addr(), "", 0, nil)
+	defer adapter.Close()
+
+	if err := adapter.Connect(); err != nil {
+		t.Fatalf("adapter connect failed: %v", err)
+	}
+
+	// KV 操作
+	if err := adapter.Set("adapter_key", "adapter_value"); err != nil {
+		t.Fatalf("adapter Set failed: %v", err)
+	}
+	val, err := adapter.Get("adapter_key")
+	if err != nil {
+		t.Fatalf("adapter Get failed: %v", err)
+	}
+	if val != "adapter_value" {
+		t.Errorf("expected 'adapter_value', got %q", val)
+	}
+
+	// Do
+	if _, err := adapter.Do("SET", "do_key", "do_val"); err != nil {
+		t.Fatalf("adapter Do SET failed: %v", err)
+	}
+
+	// Pub/Sub 回调模式
+	callbackCh := make(chan string, 1)
+	if err := adapter.Subscribe("adapter_chan", func(ch, msg string) {
+		callbackCh <- msg
+	}); err != nil {
+		t.Fatalf("adapter Subscribe failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if err := adapter.Publish("adapter_chan", "hello_adapter"); err != nil {
+		t.Fatalf("adapter Publish failed: %v", err)
+	}
+
+	select {
+	case msg := <-callbackCh:
+		if msg != "hello_adapter" {
+			t.Errorf("adapter callback: expected 'hello_adapter', got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter callback: timeout")
+	}
+
+	// Pub/Sub Ordered 模式
+	orderedCh := make(chan string, 5)
+	if err := adapter.SubscribeWithOptions("adapter_ordered", func(ch, msg string) {
+		orderedCh <- msg
+	}, SubscribeOptions{Ordered: true}); err != nil {
+		t.Fatalf("adapter SubscribeWithOptions failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if err := adapter.Publish("adapter_ordered", "ordered_msg"); err != nil {
+		t.Fatalf("adapter Publish failed: %v", err)
+	}
+
+	select {
+	case msg := <-orderedCh:
+		if msg != "ordered_msg" {
+			t.Errorf("adapter ordered: expected 'ordered_msg', got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter ordered: timeout")
+	}
+
+	// 状态与指标
+	if adapter.GetState() != StateConnected {
+		t.Errorf("expected StateConnected, got %v", adapter.GetState())
+	}
+	metrics := adapter.GetMetrics()
+	if metrics.SubscriptionCount < 2 {
+		t.Errorf("expected at least 2 subscriptions, got %d", metrics.SubscriptionCount)
+	}
+}
+
+// TestSubscribeWithOptions_Recovery 验证 Ordered 订阅在重连后自动恢复
+func TestSubscribeWithOptions_Recovery(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	addr := m.Addr()
+
+	cfg := &ReconnectConfig{
+		MaxRetries:   100,
+		InitialDelay: 20 * time.Millisecond,
+		MaxDelay:     100 * time.Millisecond,
+	}
+	c := NewClient(addr, "", 0, cfg)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	msgCh := make(chan string, 10)
+	err = c.SubscribeWithOptions("recovery_ordered", func(ch, msg string) {
+		msgCh <- msg
+	}, SubscribeOptions{Ordered: true})
+	if err != nil {
+		t.Fatalf("SubscribeWithOptions failed: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// 关闭 Redis
+	m.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	// 重启
+	if err := m.StartAddr(addr); err != nil {
+		t.Skipf("cannot restart on same addr: %v", err)
+	}
+
+	// 等待重连
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if c.GetState() == StateConnected {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond) // 给重订阅时间
+
+	// 发送消息验证恢复
+	if err := c.Publish("recovery_ordered", "after_reconnect"); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg != "after_reconnect" {
+			t.Errorf("expected 'after_reconnect', got %q", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("timeout — Ordered subscription recovery failed")
+	}
+
+	m.Close()
+}
+
+// ============================================================================
+// Commander 接口兼容性测试 — 验证 Redic 和 Redigo 行为一致
+// ============================================================================
+
+// commanderTestSuite 对任意 Commander 执行统一行为验证
+func commanderTestSuite(t *testing.T, name string, newCommander func(addr string) Commander) {
+	t.Helper()
+
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("[%s] failed to start miniredis: %v", name, err)
+	}
+	defer m.Close()
+
+	cmd := newCommander(m.Addr())
+	defer cmd.Close()
+
+	if err := cmd.Connect(); err != nil {
+		t.Fatalf("[%s] Connect failed: %v", name, err)
+	}
+
+	// --- Set / Get ---
+	if err := cmd.Set("test_key", "test_value"); err != nil {
+		t.Fatalf("[%s] Set failed: %v", name, err)
+	}
+	val, err := cmd.Get("test_key")
+	if err != nil {
+		t.Fatalf("[%s] Get failed: %v", name, err)
+	}
+	if val != "test_value" {
+		t.Errorf("[%s] Get: expected 'test_value', got %q", name, val)
+	}
+
+	// --- Do (SET + GET) ---
+	if _, err := cmd.Do("SET", "do_key", "do_val"); err != nil {
+		t.Fatalf("[%s] Do SET failed: %v", name, err)
+	}
+	reply, err := cmd.Do("GET", "do_key")
+	if err != nil {
+		t.Fatalf("[%s] Do GET failed: %v", name, err)
+	}
+	got, _ := redis.String(reply, nil)
+	if got != "do_val" {
+		t.Errorf("[%s] Do GET: expected 'do_val', got %q", name, got)
+	}
+
+	// --- DoContext ---
+	ctx := context.Background()
+	if _, err := cmd.DoContext(ctx, "SET", "ctx_key", "ctx_val"); err != nil {
+		t.Fatalf("[%s] DoContext SET failed: %v", name, err)
+	}
+	reply, err = cmd.DoContext(ctx, "GET", "ctx_key")
+	if err != nil {
+		t.Fatalf("[%s] DoContext GET failed: %v", name, err)
+	}
+	got, _ = redis.String(reply, nil)
+	if got != "ctx_val" {
+		t.Errorf("[%s] DoContext GET: expected 'ctx_val', got %q", name, got)
+	}
+
+	// --- DoContext with cancelled context ---
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = cmd.DoContext(cancelCtx, "GET", "ctx_key")
+	if err == nil {
+		t.Errorf("[%s] DoContext with cancelled ctx: expected error, got nil", name)
+	}
+
+	// --- Publish (no subscriber, should not error) ---
+	if err := cmd.Publish("no_sub_ch", "msg"); err != nil {
+		t.Fatalf("[%s] Publish failed: %v", name, err)
+	}
+
+	// --- Do: various data types ---
+	if _, err := cmd.Do("SET", "int_key", 42); err != nil {
+		t.Fatalf("[%s] Do SET int failed: %v", name, err)
+	}
+	reply, _ = cmd.Do("GET", "int_key")
+	got, _ = redis.String(reply, nil)
+	if got != "42" {
+		t.Errorf("[%s] Do GET int: expected '42', got %q", name, got)
+	}
+
+	// --- Do: HSET / HGET ---
+	if _, err := cmd.Do("HSET", "hash_key", "field1", "v1"); err != nil {
+		t.Fatalf("[%s] Do HSET failed: %v", name, err)
+	}
+	reply, err = cmd.Do("HGET", "hash_key", "field1")
+	if err != nil {
+		t.Fatalf("[%s] Do HGET failed: %v", name, err)
+	}
+	got, _ = redis.String(reply, nil)
+	if got != "v1" {
+		t.Errorf("[%s] Do HGET: expected 'v1', got %q", name, got)
+	}
+
+	// --- Do: DEL ---
+	if _, err := cmd.Do("DEL", "test_key", "do_key"); err != nil {
+		t.Fatalf("[%s] Do DEL failed: %v", name, err)
+	}
+	_, err = cmd.Get("test_key")
+	if err == nil {
+		t.Errorf("[%s] Get deleted key: expected error (ErrNil), got nil", name)
+	}
+
+	// --- Do: non-existent key ---
+	_, err = cmd.Get("nonexistent_key_12345")
+	if err == nil {
+		t.Errorf("[%s] Get nonexistent: expected error, got nil", name)
+	}
+
+	// --- Do: INCR ---
+	if _, err := cmd.Do("SET", "counter", "0"); err != nil {
+		t.Fatalf("[%s] Do SET counter failed: %v", name, err)
+	}
+	reply, err = cmd.Do("INCR", "counter")
+	if err != nil {
+		t.Fatalf("[%s] Do INCR failed: %v", name, err)
+	}
+	intVal, _ := redis.Int(reply, nil)
+	if intVal != 1 {
+		t.Errorf("[%s] INCR: expected 1, got %d", name, intVal)
+	}
+
+	// --- Do: EXPIRE + TTL ---
+	if _, err := cmd.Do("SET", "ttl_key", "expiring"); err != nil {
+		t.Fatalf("[%s] Do SET ttl_key failed: %v", name, err)
+	}
+	if _, err := cmd.Do("EXPIRE", "ttl_key", 100); err != nil {
+		t.Fatalf("[%s] Do EXPIRE failed: %v", name, err)
+	}
+	reply, err = cmd.Do("TTL", "ttl_key")
+	if err != nil {
+		t.Fatalf("[%s] Do TTL failed: %v", name, err)
+	}
+	ttl, _ := redis.Int(reply, nil)
+	if ttl <= 0 || ttl > 100 {
+		t.Errorf("[%s] TTL: expected 1-100, got %d", name, ttl)
+	}
+
+	// --- Close + re-Close idempotent ---
+	if err := cmd.Close(); err != nil {
+		t.Errorf("[%s] Close failed: %v", name, err)
+	}
+}
+
+// TestRedicCommander 使用 commanderTestSuite 验证 redicCommander
+func TestRedicCommander(t *testing.T) {
+	commanderTestSuite(t, "redicCommander", func(addr string) Commander {
+		return NewRedicCommander(addr, "", 0, nil)
+	})
+}
+
+// TestRedigoCommander 使用 commanderTestSuite 验证 redigoCommander
+func TestRedigoCommander(t *testing.T) {
+	commanderTestSuite(t, "redigoCommander", func(addr string) Commander {
+		cfg := DefaultRedigoConfig(addr, "", 0)
+		return NewRedigoCommander(cfg)
+	})
+}
+
+// TestCommanderBehaviorParity 同时建两个 Commander，对同一 Redis 写入/读取，验证行为完全一致
+func TestCommanderBehaviorParity(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	redicCmd := NewRedicCommander(m.Addr(), "", 0, nil)
+	defer redicCmd.Close()
+	if err := redicCmd.Connect(); err != nil {
+		t.Fatalf("redicCmd connect failed: %v", err)
+	}
+
+	redigoCmd := NewRedigoCommander(DefaultRedigoConfig(m.Addr(), "", 0))
+	defer redigoCmd.Close()
+	if err := redigoCmd.Connect(); err != nil {
+		t.Fatalf("redigoCmd connect failed: %v", err)
+	}
+
+	// Redic 写，Redigo 读
+	if err := redicCmd.Set("parity_key", "from_redic"); err != nil {
+		t.Fatalf("redicCmd Set failed: %v", err)
+	}
+	val, err := redigoCmd.Get("parity_key")
+	if err != nil {
+		t.Fatalf("redigoCmd Get failed: %v", err)
+	}
+	if val != "from_redic" {
+		t.Errorf("cross-read: expected 'from_redic', got %q", val)
+	}
+
+	// Redigo 写，Redic 读
+	if err := redigoCmd.Set("parity_key2", "from_redigo"); err != nil {
+		t.Fatalf("redigoCmd Set failed: %v", err)
+	}
+	val, err = redicCmd.Get("parity_key2")
+	if err != nil {
+		t.Fatalf("redicCmd Get failed: %v", err)
+	}
+	if val != "from_redigo" {
+		t.Errorf("cross-read: expected 'from_redigo', got %q", val)
+	}
+
+	// 两方 Do("INCR") 同一 key
+	if _, err := redicCmd.Do("SET", "shared_counter", "0"); err != nil {
+		t.Fatalf("SET counter failed: %v", err)
+	}
+	redicCmd.Do("INCR", "shared_counter")  // 1
+	redigoCmd.Do("INCR", "shared_counter") // 2
+	redicCmd.Do("INCR", "shared_counter")  // 3
+
+	reply, err := redigoCmd.Do("GET", "shared_counter")
+	if err != nil {
+		t.Fatalf("GET counter failed: %v", err)
+	}
+	got, _ := redis.String(reply, nil)
+	if got != "3" {
+		t.Errorf("shared counter: expected '3', got %q", got)
+	}
+
+	// Publish — 不 panic，不报错即可
+	redicCmd.Publish("test_ch", "a")
+	redigoCmd.Publish("test_ch", "b")
+}
+
+// TestCommanderInterfaceAssignment 编译时验证接口实现
+func TestCommanderInterfaceAssignment(t *testing.T) {
+	// 确保类型满足 Commander 接口
+	var _ Commander = (*redicCommander)(nil)
+	var _ Commander = (*redigoCommander)(nil)
+
+	// 确保 Adapter 包含 Commander
+	var _ Commander = (Adapter)(nil)
+
+	// 确保 redicAdapter 满足 Adapter
+	var _ Adapter = (*redicAdapter)(nil)
+}
+
+// TestRedigoCommander_String 验证 redigoCommander.String() 可调用
+func TestRedigoCommander_String(t *testing.T) {
+	cfg := DefaultRedigoConfig("127.0.0.1:6379", "", 0)
+	rc := NewRedigoCommander(cfg)
+	// 调用并验证返回包含地址信息
+	s := rc.(*redigoCommander).String()
+	if s == "" {
+		t.Error("redigoCommander.String returned empty string")
+	}
+}
+
+// TestSubscription_OnMessageDropped 验证当处理队列满且超时后会触发 OnMessageDropped 回调
+func TestSubscription_OnMessageDropped(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	var dropped int32
+	cfg := DefaultReconnectConfig()
+	cfg.SubscriptionWorkerPoolSize = 1
+	cfg.SubscriptionBufferSize = 1
+	cfg.SubscriptionDispatchTimeout = 20 * time.Millisecond
+	cfg.OnMessageDropped = func(ch string) {
+		atomic.AddInt32(&dropped, 1)
+	}
+
+	c := NewClient(m.Addr(), "", 0, cfg)
+	defer c.Close()
+	if err := c.Connect(); err != nil {
+		t.Fatalf("connect failed: %v", err)
+	}
+
+	// 处理函数故意慢，导致队列积压
+	if err := c.SubscribeWithOptions("bp_test", func(ch, msg string) {
+		time.Sleep(150 * time.Millisecond)
+	}, SubscribeOptions{Ordered: false}); err != nil {
+		t.Fatalf("SubscribeWithOptions failed: %v", err)
+	}
+
+	// 迅速发送多条消息以触发丢弃
+	for i := 0; i < 10; i++ {
+		if err := c.Publish("bp_test", fmt.Sprintf("m%d", i)); err != nil {
+			t.Fatalf("publish failed: %v", err)
+		}
+	}
+
+	// 等待一段时间让丢弃发生
+	time.Sleep(800 * time.Millisecond)
+
+	if atomic.LoadInt32(&dropped) == 0 {
+		t.Errorf("expected some messages to be dropped, got %d", dropped)
+	}
+}
+
+func TestAdapterConstructorsAndPSubscribeWrappers(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	// create a client
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+
+	// NewRedicCommanderFromClient and NewAdapterFromClient should construct without panic
+	_ = NewRedicCommanderFromClient(c)
+	a := NewAdapterFromClient(c)
+
+	// Call PSubscribe and PUnsubscribe wrappers (provide dummy handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, _ = a.DoContext(ctx, "PING")
+
+	// PSubscribe and PUnsubscribe wrappers should not panic
+	_ = a.PSubscribe("pattern", func(ch, msg string) {})
+	_ = a.PUnsubscribe("pattern")
+
+	// PSubscribeWithOptions
+	_ = a.PSubscribeWithOptions("pattern", func(ch, msg string) {}, SubscribeOptions{Ordered: true})
+}
+
+func TestIsNetworkErrorAndInvokeHandlerPanicRecovery(t *testing.T) {
+	// isNetworkError: EOF should be considered network error
+	if !isNetworkError(io.EOF) {
+		t.Fatal("io.EOF should be network error")
+	}
+
+	// redis.ErrNil is not a network error
+	if isNetworkError(redis.ErrNil) {
+		t.Fatal("redis.ErrNil should not be network error")
+	}
+
+	// Test invokeHandler recovers from panic
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+	sm := NewSubscriptionManager(c.pool, c, 1)
+
+	// handler that panics
+	handler := func(ch, msg string) { panic("boom") }
+
+	// should not panic
+	sm.invokeHandler(handler, "ch", "msg")
+}
+
+func TestTriggerReconnectBranches(t *testing.T) {
+	m, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("failed to start miniredis: %v", err)
+	}
+	defer m.Close()
+
+	c := NewClient(m.Addr(), "", 0, nil)
+	defer c.Close()
+
+	// Set state to Disconnected and ensure triggerReconnect returns quickly
+	atomic.StoreInt32(&c.state, int32(StateDisconnected))
+	c.triggerReconnect(errors.New("test"))
+
+	// Set to Reconnecting and ensure another early return
+	atomic.StoreInt32(&c.state, int32(StateReconnecting))
+	c.triggerReconnect(errors.New("test"))
+
+	// Now set to Connected and trigger reconnect to start reconnection
+	atomic.StoreInt32(&c.state, int32(StateConnected))
+	// make reconnect quick
+	c.reconnectConfig.MaxRetries = 1
+	c.reconnectConfig.InitialDelay = 1 * time.Millisecond
+
+	c.triggerReconnect(errors.New("network"))
+
+	// wait briefly for goroutine to set state
+	time.Sleep(25 * time.Millisecond)
+	s := ConnectionState(atomic.LoadInt32(&c.state))
+	if s != StateReconnecting && s != StateFailed && s != StateConnected {
+		t.Fatalf("unexpected state after triggerReconnect: %v", s)
 	}
 }
 

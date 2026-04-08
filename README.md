@@ -149,4 +149,74 @@ cfg.OnMessageDropped = func(channel string) {
 }
 
 client := redic.NewClient(addr, pwd, db, cfg)
+
+// ---------------------------------------------------------------------------
+// 适配层与迁移说明（Adapter / Commander）
+// ---------------------------------------------------------------------------
+
+Adapter 模式
+----------------
+Redic 提供了一组适配层接口，便于在不同实现之间切换：
+
+- `Commander`：仅包含命令执行能力 (`Do`, `Get`, `Set`, `Publish` 等)，适合替换现有基于 `redis.Pool` 的调用点。
+- `Subscriber`：Redic 专有的订阅回调接口，包含 `Subscribe`、`PSubscribe` 及带选项的变体。
+- `Adapter`：`Commander + Subscriber` 的组合，并额外暴露 `GetState()` 与 `GetMetrics()` 用于可观测性。
+
+常见迁移场景
+----------------
+1) 你当前使用 `redis.Pool` 并直接调用 `conn.Do(...)`：
+
+```go
+// 原：redigo
+conn := pool.Get()
+defer conn.Close()
+conn.Do("SET", "k", "v")
+
+// 迁移后：使用 Commander（可选切换为 Redigo 或 Redic 实现）
+cmd := redic.NewRedicCommander("localhost:6379", "", 0, nil) // Redic-backed
+// 或：cmd := redic.NewRedigoCommander(redic.DefaultRedigoConfig("localhost:6379", "", 0))
+cmd.Connect()
+defer cmd.Close()
+cmd.Do("SET", "k", "v")
+```
+
+2) 你希望同时保留命令与订阅能力：
+
+```go
+// 使用完整 Adapter（包含订阅能力）
+adapter := redic.NewAdapter("localhost:6379", "", 0, nil)
+defer adapter.Close()
+
+// 命令调用
+adapter.Do("SET", "k", "v")
+
+// 订阅
+adapter.Subscribe("news", func(ch, msg string) {
+    fmt.Println("news:", msg)
+})
+```
+
+3) 平滑切换实现：只要你的代码依赖 `Commander` 接口，就能在运行时或测试中替换为 `redigoCommander` 或 `redicCommander`：
+
+```go
+var cmd redic.Commander
+if useRedigo {
+    cmd = redic.NewRedigoCommander(redic.DefaultRedigoConfig(addr, "", 0))
+} else {
+    cmd = redic.NewRedicCommander(addr, "", 0, nil)
+}
+cmd.Connect()
+defer cmd.Close()
+```
+
+注意事项
+----------------
+- Redic 的 `Subscriber` 接口是 Redic 的增值能力：原生 `redigo` 的 `PubSubConn` 模型与回调模型不兼容，所以如果你的代码依赖阻塞式 `Receive()` 循环，迁移时需要改为回调式 `Subscribe` 或自行保持 `redigo` 的 `PubSubConn`。
+- 如果你打算发布到 v2 或更高版本，请在发布前根据语义导入版本规范对 `module` 路径做相应调整（例如 `github.com/yourorg/redic/v2`）。
+
+
+## 许可证 (License)
+
+本项目采用 MIT 许可证许可。详情请见仓库根目录的 [LICENSE](LICENSE) 文件。
+
 ```

@@ -166,11 +166,23 @@ func DefaultReconnectConfig() *ReconnectConfig {
 // 订阅信息实体
 // --------------------------------------------------------------------------------
 
+// SubscribeOptions 控制单个订阅的消息分发行为
+type SubscribeOptions struct {
+	// Ordered 为 true 时，handler 在 Receiver 协程中同步执行，
+	// 保证同一订阅的消息严格按到达顺序处理。
+	// 注意：handler 必须快速返回，否则会阻塞整个订阅连接的消息接收。
+	//
+	// 为 false（默认）时，handler 通过 Worker Pool 异步执行，
+	// 吞吐量更高但不保证顺序。
+	Ordered bool
+}
+
 type SubscriptionInfo struct {
 	Channel   string
 	Pattern   string
 	Handler   func(channel, message string)
 	IsPattern bool
+	Ordered   bool // 是否同步顺序分发
 }
 
 func (s *SubscriptionInfo) Key() string {
@@ -321,6 +333,46 @@ func (sm *SubscriptionManager) PSubscribe(pattern string, handler func(channel, 
 		Pattern:   pattern,
 		Handler:   handler,
 		IsPattern: true,
+	}
+
+	sm.subMu.Lock()
+	sm.subPatterns[pattern] = sub
+	sm.subMu.Unlock()
+
+	return sm.doSubscribe(sub)
+}
+
+// SubscribeWithOptions 带选项的订阅，支持 Ordered 保序模式
+func (sm *SubscriptionManager) SubscribeWithOptions(channel string, handler func(channel, message string), opts SubscribeOptions) error {
+	if handler == nil {
+		return errors.New("handler cannot be nil")
+	}
+
+	sub := &SubscriptionInfo{
+		Channel:   channel,
+		Handler:   handler,
+		IsPattern: false,
+		Ordered:   opts.Ordered,
+	}
+
+	sm.subMu.Lock()
+	sm.subChannels[channel] = sub
+	sm.subMu.Unlock()
+
+	return sm.doSubscribe(sub)
+}
+
+// PSubscribeWithOptions 带选项的模式订阅
+func (sm *SubscriptionManager) PSubscribeWithOptions(pattern string, handler func(channel, message string), opts SubscribeOptions) error {
+	if handler == nil {
+		return errors.New("handler cannot be nil")
+	}
+
+	sub := &SubscriptionInfo{
+		Pattern:   pattern,
+		Handler:   handler,
+		IsPattern: true,
+		Ordered:   opts.Ordered,
 	}
 
 	sm.subMu.Lock()
@@ -643,16 +695,21 @@ func (sm *SubscriptionManager) dispatch(channel string, data string) {
 	sub, ok := sm.subChannels[channel]
 	sm.subMu.RUnlock()
 
-	if ok && sub.Handler != nil {
-		// 使用 Worker Pool 分发任务
-		task := &dispatchTask{
-			handler: sub.Handler,
-			channel: channel,
-			message: data,
-		}
-
-		sm.submitTask(task)
+	if !ok || sub.Handler == nil {
+		return
 	}
+
+	// Ordered 模式：同步调用，保证严格顺序
+	if sub.Ordered {
+		sm.invokeHandler(sub.Handler, channel, data)
+		return
+	}
+
+	sm.submitTask(&dispatchTask{
+		handler: sub.Handler,
+		channel: channel,
+		message: data,
+	})
 }
 
 func (sm *SubscriptionManager) dispatchPatternMessage(msg redis.Message) {
@@ -660,15 +717,30 @@ func (sm *SubscriptionManager) dispatchPatternMessage(msg redis.Message) {
 	sub, ok := sm.subPatterns[msg.Pattern]
 	sm.subMu.RUnlock()
 
-	if ok && sub.Handler != nil {
-		task := &dispatchTask{
-			handler: sub.Handler,
-			channel: msg.Channel, // 传递实际的 Channel
-			message: string(msg.Data),
-		}
-
-		sm.submitTask(task)
+	if !ok || sub.Handler == nil {
+		return
 	}
+
+	if sub.Ordered {
+		sm.invokeHandler(sub.Handler, msg.Channel, string(msg.Data))
+		return
+	}
+
+	sm.submitTask(&dispatchTask{
+		handler: sub.Handler,
+		channel: msg.Channel,
+		message: string(msg.Data),
+	})
+}
+
+// invokeHandler 同步调用 handler（用于 Ordered 模式），带 panic 保护
+func (sm *SubscriptionManager) invokeHandler(handler func(string, string), channel, data string) {
+	defer func() {
+		if r := recover(); r != nil {
+			sm.logger.Printf("[Redic] Handler panic: %v", r)
+		}
+	}()
+	handler(channel, data)
 }
 
 // 统一的提交任务逻辑，支持超时和回调
@@ -1088,6 +1160,16 @@ func (c *Client) Unsubscribe(channels ...string) error {
 
 func (c *Client) PUnsubscribe(patterns ...string) error {
 	return c.subManager.PUnsubscribe(patterns...)
+}
+
+// SubscribeWithOptions 带选项的订阅（支持 Ordered 保序模式）
+func (c *Client) SubscribeWithOptions(channel string, handler func(ch, msg string), opts SubscribeOptions) error {
+	return c.subManager.SubscribeWithOptions(channel, handler, opts)
+}
+
+// PSubscribeWithOptions 带选项的模式订阅
+func (c *Client) PSubscribeWithOptions(pattern string, handler func(ch, msg string), opts SubscribeOptions) error {
+	return c.subManager.PSubscribeWithOptions(pattern, handler, opts)
 }
 
 // checkReady 检查客户端是否处于可用状态
